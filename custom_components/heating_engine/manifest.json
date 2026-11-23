@@ -1,0 +1,14 @@
+{
+  "domain": "heating_engine",
+  "name": "Heating Engine",
+  "version": "0.1.0",
+  "codeowners": ["@gregoryjameswalsh"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/gregoryjameswalsh/ha-heating-engine",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/gregoryjameswalsh/ha-heating-engine/issues",
+  "requirements": [],
+  "single_config_entry": true
+}

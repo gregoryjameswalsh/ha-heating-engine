@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Anything household-specific stays out of this public repo.
+# Keep real config, denylists and private tests in a folder OUTSIDE the repo,
+# or under private/ which is ignored here as a last line of defence.
+private/
+*.local.*
+*.secret.*
