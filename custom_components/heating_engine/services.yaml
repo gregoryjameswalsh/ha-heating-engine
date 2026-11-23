@@ -1,0 +1,63 @@
+boost:
+  fields:
+    room:
+      required: true
+      example: blue_room
+      selector:
+        text:
+    temp:
+      required: false
+      example: 21
+      selector:
+        number:
+          min: 5
+          max: 30
+          step: 0.5
+          unit_of_measurement: "°C"
+    minutes:
+      required: false
+      default: 60
+      selector:
+        number:
+          min: 5
+          max: 720
+          step: 5
+          unit_of_measurement: min
+
+cancel_boost:
+  fields:
+    room:
+      required: true
+      example: blue_room
+      selector:
+        text:
+
+set_exception:
+  fields:
+    person:
+      required: true
+      example: pip
+      selector:
+        text:
+    night:
+      required: true
+      example: "2026-01-08"
+      selector:
+        date:
+    here:
+      required: true
+      selector:
+        boolean:
+
+clear_exception:
+  fields:
+    person:
+      required: true
+      example: pip
+      selector:
+        text:
+    night:
+      required: true
+      example: "2026-01-08"
+      selector:
+        date:

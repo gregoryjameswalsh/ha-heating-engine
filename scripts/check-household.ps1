@@ -21,7 +21,9 @@ param(
     [string]$Denylist = ''
 )
 
-$ErrorActionPreference = 'Stop'
+# Not 'Stop': under PowerShell 5.1 a native command's stderr (a git line-ending
+# warning, say) would then become a terminating error and abort the check.
+$ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 Set-Location $root
 
@@ -56,11 +58,11 @@ if ($Denylist) {
 # What is about to leave the machine: committed changes against the base, plus
 # anything staged or unstaged, plus untracked files.
 $diff = @()
-$diff += git diff "$Range...HEAD" 2>$null
-$diff += git diff HEAD 2>$null
+$diff += git -c core.safecrlf=false diff "$Range...HEAD"
+$diff += git -c core.safecrlf=false diff HEAD
 $untracked = git ls-files --others --exclude-standard
 foreach ($f in $untracked) { $diff += Get-Content $f -ErrorAction SilentlyContinue | ForEach-Object { "+" + $_ } }
-$log = git log --format='%s%n%b' "$Range..HEAD" 2>$null
+$log = git log --format='%s%n%b' "$Range..HEAD"
 
 $added = $diff | Where-Object { $_ -match '^\+' -and $_ -notmatch '^\+\+\+' }
 Write-Output ("checking " + $added.Count + " added lines and " + ($log | Measure-Object -Line).Lines + " commit-message lines")

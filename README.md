@@ -71,6 +71,46 @@ days are covered by tests.
 - A health sensor carries a heartbeat; something outside the integration should
   watch it and shout if it goes stale.
 
+## What it exposes
+
+Websocket commands (send them over the normal Home Assistant websocket):
+
+| Command | Payload | Returns |
+|---|---|---|
+| `heating_engine/get_config` | none | `{config, rev, api_version}` |
+| `heating_engine/set_config` | `{config, base_rev}` | `{rev}`, or error `rev_conflict` / `invalid_config` with a plain message |
+| `heating_engine/plan` | `{start, end}` ISO datetimes, at most 15 days | `{segments: [...]}` |
+| `heating_engine/log` | none | the would-write log, writes sent, and every change the engine did not make |
+
+Services: `heating_engine.boost` (`room`, optional `temp`, optional `minutes`),
+`heating_engine.cancel_boost` (`room`), `heating_engine.set_exception`
+(`person`, `night`, `here`), `heating_engine.clear_exception` (`person`, `night`).
+
+Entities:
+
+| Entity | State | Attributes |
+|---|---|---|
+| `sensor.heating_<room>_target` | target in degrees | `mode` (observe or control), `reason_code`, `reason_text`, `rule`, `next_change`, `confirmed`, `current_setpoint`, `current_mode`, `current_temperature`, `would_write`, `pending_write`, `problem`, `boost_until` |
+| `binary_sensor.heating_engine_healthy` | on / off | `last_evaluated`, `config_rev`, `api_version`, `unexpected_changes_24h`, `write_failures`, `calendar_ok`, `problems` |
+| `binary_sensor.heating_<person>_here` | on / off | `source` (rota, exception, always, calendar), `until` |
+
+The health sensor cannot report its own death. See
+[docs/dashboard-notices.md](docs/dashboard-notices.md) for the watchdog that
+lives outside the integration.
+
+## Reading the observe-mode log
+
+With every room in observe mode the engine writes nothing, but it says what it
+would have written. Three places to read it:
+
+1. **Logbook / logs.** Settings, System, Logs, search `heating_engine`. Lines
+   start `would write:`, `write:` or `Unexpected setpoint change`.
+2. **The websocket.** `heating_engine/log` returns the same three lists as JSON.
+3. **The sensors.** `sensor.heating_<room>_target` carries `would_write: true`
+   while the valve differs from the target.
+
+A would-write line is logged once per distinct target, not every minute.
+
 ## Config document
 
 One JSON document, stored by the integration. An example with an invented

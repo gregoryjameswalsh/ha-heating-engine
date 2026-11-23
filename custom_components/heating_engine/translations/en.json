@@ -1,0 +1,48 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Heating Engine",
+        "description": "Adds the heating engine. Rooms, people and schedules are set up afterwards over the websocket API, not here."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one heating engine can be set up."
+    }
+  },
+  "services": {
+    "boost": {
+      "name": "Boost",
+      "description": "Hold a room at a temperature for a while.",
+      "fields": {
+        "room": { "name": "Room", "description": "The room id from the config document." },
+        "temp": { "name": "Temperature", "description": "Target in degrees. Defaults to the room's comfort temperature." },
+        "minutes": { "name": "Minutes", "description": "How long. Defaults to 60." }
+      }
+    },
+    "cancel_boost": {
+      "name": "Cancel boost",
+      "description": "End a room's boost now.",
+      "fields": {
+        "room": { "name": "Room", "description": "The room id from the config document." }
+      }
+    },
+    "set_exception": {
+      "name": "Set exception",
+      "description": "Mark whether a person sleeps here on one night, overriding the rota.",
+      "fields": {
+        "person": { "name": "Person", "description": "The person id from the config document." },
+        "night": { "name": "Night", "description": "The date of the night, YYYY-MM-DD." },
+        "here": { "name": "Here", "description": "True if they sleep here that night." }
+      }
+    },
+    "clear_exception": {
+      "name": "Clear exception",
+      "description": "Remove a one-night exception so the rota applies again.",
+      "fields": {
+        "person": { "name": "Person", "description": "The person id from the config document." },
+        "night": { "name": "Night", "description": "The date of the night, YYYY-MM-DD." }
+      }
+    }
+  }
+}
