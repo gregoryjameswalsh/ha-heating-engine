@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.1 — 2026-11-23
+
+- **The last successful calendar read is kept across restarts.** Seen live after a Home Assistant restart: the engine evaluated before the calendar integration had loaded, `calendar.get_events` was "not found", and with no events every calendar person counted as home for five minutes. Now the last known events are stored with the runtime state and used until a read succeeds, the integration loads after `calendar`, and while nothing is known a failed read is retried every minute rather than every five. The problem text says which it is: "using the last known trips" or "nobody is treated as away".
+
 ## v0.2.0 — 2026-11-23
 
 - **A boost writes to the valve even while the room is observing.** It is an explicit, time-bounded request. For an observing room the engine remembers the setpoint the valve held before the boost and puts it back when the boost ends or is cancelled, instead of its own schedule target. A room in control simply resumes its schedule.

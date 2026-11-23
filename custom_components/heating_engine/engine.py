@@ -184,7 +184,10 @@ class HeatingEngine:
     async def async_start(self) -> None:
         today = dt_util.now().date()
         self.config = await self._config_store.load(today)
-        self.state, self.changes = await self._state_store.load()
+        self.state, self.changes, self.calendar_events = await self._state_store.load()
+        if self.calendar_events:
+            self.calendar_ok = None  # last known, not yet confirmed this run
+            _LOGGER.info("Using the last known calendar events (%s) until the first read succeeds", ", ".join(self.calendar_events))
         self.started_at = dt_util.utcnow()
         _LOGGER.info(
             "Heating engine starting: config rev %s, %d rooms (%d in control), %d people, api_version %s",
@@ -205,7 +208,7 @@ class HeatingEngine:
         if self._unsub_states:
             self._unsub_states()
             self._unsub_states = None
-        await self._state_store.save(self.state, self.changes)
+        await self._state_store.save(self.state, self.changes, self.calendar_events)
 
     def _subscribe_states(self) -> None:
         if self._unsub_states:
@@ -348,7 +351,7 @@ class HeatingEngine:
                 if self._state_dirty:
                     self._state_dirty = False
                     try:
-                        await self._state_store.save(self.state, self.changes)
+                        await self._state_store.save(self.state, self.changes, self.calendar_events)
                     except Exception:  # noqa: BLE001
                         _LOGGER.exception("Could not save runtime state")
                 async_dispatcher_send(self.hass, SIGNAL_UPDATED)
@@ -363,7 +366,8 @@ class HeatingEngine:
 
         await self._maybe_refresh_calendars(now)
         if self.calendar_ok is False:
-            problems.append(Problem(PROBLEM_CALENDAR, None, f"Can't check the calendar: {self.calendar_error}"))
+            known = "using the last known trips" if self.calendar_events else "nobody is treated as away"
+            problems.append(Problem(PROBLEM_CALENDAR, None, f"Can't check the calendar ({known}): {self.calendar_error}"))
 
         self._expire_runtime(now)
 
@@ -560,8 +564,11 @@ class HeatingEngine:
         if not calendars:
             self.calendar_ok = None
             return
-        if self._calendar_fetched_at is not None and now - self._calendar_fetched_at < CALENDAR_REFRESH:
-            return
+        if self._calendar_fetched_at is not None:
+            # after a failure with nothing known, try again every minute; otherwise every 5
+            wait = timedelta(minutes=1) if (self.calendar_ok is False and not self.calendar_events) else CALENDAR_REFRESH
+            if now - self._calendar_fetched_at < wait:
+                return
         start = (now - CALENDAR_LOOKBACK).isoformat()
         end = (now + CALENDAR_LOOKAHEAD).isoformat()
         fetched: dict[str, list[CalendarEvent]] = {}
@@ -582,6 +589,8 @@ class HeatingEngine:
             _LOGGER.warning("Calendar read failed, keeping the last known events: %s", self.calendar_error)
             self._calendar_fetched_at = now  # do not hammer a broken calendar every minute
             return
+        if fetched != self.calendar_events:
+            self._state_dirty = True  # persist the last known events for the next restart
         self.calendar_events = fetched
         self.calendar_ok = True
         self.calendar_error = None

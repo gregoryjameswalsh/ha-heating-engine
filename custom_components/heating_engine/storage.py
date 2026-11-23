@@ -15,7 +15,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 
 from .const import STORAGE_KEY_CONFIG, STORAGE_KEY_STATE, STORAGE_VERSION
-from .heating_core import Boost, Config, EngineState, ManualOverride
+from .heating_core import Boost, CalendarEvent, Config, EngineState, ManualOverride
 from .heating_core.apply import ChangeLog
 
 
@@ -43,9 +43,18 @@ class StateStore:
     def __init__(self, hass: HomeAssistant) -> None:
         self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY_STATE)
 
-    async def load(self) -> tuple[EngineState, ChangeLog]:
+    async def load(self) -> tuple[EngineState, ChangeLog, dict[str, list[CalendarEvent]]]:
         raw = await self._store.async_load() or {}
         state = EngineState()
+        calendars: dict[str, list[CalendarEvent]] = {}
+        for cal, events in (raw.get("calendars") or {}).items():
+            out: list[CalendarEvent] = []
+            for ev in events:
+                try:
+                    out.append(CalendarEvent(start=datetime.fromisoformat(ev["start"]), end=datetime.fromisoformat(ev["end"])))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            calendars[str(cal)] = out
         for b in raw.get("boosts", []):
             try:
                 state.boosts[b["room"]] = Boost(
@@ -63,11 +72,14 @@ class StateStore:
             except (KeyError, ValueError, TypeError):
                 continue
         log = ChangeLog.from_list(raw.get("changes", []))
-        return state, log
+        return state, log, calendars
 
-    async def save(self, state: EngineState, log: ChangeLog) -> None:
+    async def save(self, state: EngineState, log: ChangeLog, calendars: dict[str, list[CalendarEvent]] | None = None) -> None:
         await self._store.async_save(
             {
+                # the last successful calendar read, so a restart keeps the last known
+                # away state instead of guessing "home" until the first read succeeds
+                "calendars": {cal: [{"start": e.start.isoformat(), "end": e.end.isoformat()} for e in events] for cal, events in (calendars or {}).items()},
                 "boosts": [
                     {"room": b.room, "temp": b.temp, "until": b.until.isoformat(), "start": b.start.isoformat() if b.start else None, "restore_temp": b.restore_temp}
                     for b in state.boosts.values()
