@@ -171,6 +171,8 @@ class HeatingEngine:
         self.would_write_log: list[dict[str, Any]] = []
         self.write_log: list[dict[str, Any]] = []
         self._last_would: dict[str, tuple[float, str | None]] = {}
+        # room id -> setpoint to put back once a boost on an observing room has ended
+        self._restore: dict[str, float] = {}
         self._state_dirty = False
         self._lock = asyncio.Lock()
         self._unsub: list[Callable[[], None]] = []
@@ -271,17 +273,32 @@ class HeatingEngine:
         now = dt_util.utcnow()
         t = float(temp) if temp is not None else room.temps.comfort
         mins = int(minutes) if minutes else DEFAULT_BOOST_MINUTES
-        self.state.boosts[room_id] = Boost(room=room_id, temp=t, until=now + timedelta(minutes=mins), start=now)
+        # A boost is the one thing the engine writes even while a room is only
+        # observing. Remember what the valve held so it can be put back after.
+        restore: float | None = None
+        existing = self.state.boosts.get(room_id)
+        if not room.control:
+            if existing is not None and existing.restore_temp is not None:
+                restore = existing.restore_temp  # a boost extended or changed keeps the original value
+            else:
+                _avail, setpoint, _mode = _setpoint_and_mode(self.hass.states.get(room.climate))
+                restore = setpoint
+        self.state.boosts[room_id] = Boost(room=room_id, temp=t, until=now + timedelta(minutes=mins), start=now, restore_temp=restore)
+        self._restore.pop(room_id, None)
         self._state_dirty = True
-        _LOGGER.info("Boost: %s to %s for %d min", room.name, t, mins)
+        _LOGGER.info("Boost: %s to %s for %d min%s", room.name, t, mins, "" if room.control else f" (observing room; will restore {restore} after)")
         await self.async_evaluate()
 
     async def async_cancel_boost(self, room_id: str) -> None:
-        if self.config.room(room_id) is None:
+        room = self.config.room(room_id)
+        if room is None:
             raise UnknownRoom(room_id)
-        if self.state.boosts.pop(room_id, None) is not None:
+        boost = self.state.boosts.pop(room_id, None)
+        if boost is not None:
             self._state_dirty = True
-            _LOGGER.info("Boost cancelled: %s", room_id)
+            if not room.control and boost.restore_temp is not None:
+                self._restore[room_id] = boost.restore_temp
+            _LOGGER.info("Boost cancelled: %s", room.name)
         await self.async_evaluate()
 
     async def async_set_exception(self, person_id: str, night: date, here: bool) -> None:
@@ -400,6 +417,15 @@ class HeatingEngine:
 
             status.pending_write = self.tracker.is_pending(room.climate)
 
+            # a boost on an observing room has just ended: put the valve back
+            restore = self._restore.pop(room.id, None)
+            if restore is not None and not room.control:
+                if needs_write(restore, setpoint, mode):
+                    await self._write(room, restore, now, status, reason="Boost ended, back to the previous setting")
+                    status.pending_write = True
+                self.rooms[room.id] = status
+                continue
+
             # does the valve differ from what we want?
             if seg is not None:
                 differs = needs_write(seg.temp, setpoint, mode)
@@ -408,7 +434,8 @@ class HeatingEngine:
                     in_flight = status.pending_write and abs(self.tracker.pending[room.climate].temp - seg.temp) <= self.tracker.tolerance
                     if in_flight:
                         pass  # written already, waiting for the valve to report it
-                    elif room.control:
+                    elif room.control or boost is not None:
+                        # control mode, or an explicit boost: the one write an observing room gets
                         await self._write(room, seg.temp, now, status)
                         status.pending_write = True
                     else:
@@ -443,6 +470,9 @@ class HeatingEngine:
             if b.until <= now:
                 del self.state.boosts[rid]
                 self._state_dirty = True
+                room = self.config.room(rid)
+                if room is not None and not room.control and b.restore_temp is not None:
+                    self._restore[rid] = b.restore_temp
                 _LOGGER.info("Boost ended: %s", rid)
         for rid, o in list(self.state.overrides.items()):
             room = self.config.room(rid)
@@ -458,9 +488,10 @@ class HeatingEngine:
 
     # ------------------------------------------------------------------ writes
 
-    async def _write(self, room: Any, temp: float, now: datetime, status: RoomStatus) -> None:
+    async def _write(self, room: Any, temp: float, now: datetime, status: RoomStatus, reason: str | None = None) -> None:
         """Send mode heat + temperature, record it as pending, remember it as ours
         on the written entity and on every watched device in the room."""
+        reason = reason or status.reason_text
         data = {ATTR_ENTITY_ID: room.climate, ATTR_TEMPERATURE: temp, ATTR_HVAC_MODE: HEAT}
         try:
             await self.hass.services.async_call(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE, data, blocking=True)
@@ -471,10 +502,10 @@ class HeatingEngine:
             self.tracker.expect(other, temp, now)
         self.writes_sent += 1
         status.last_write = now
-        entry = {"when": now.isoformat(), "room": room.id, "entity_id": room.climate, "temp": temp, "attempt": pw.attempts, "reason": status.reason_text}
+        entry = {"when": now.isoformat(), "room": room.id, "entity_id": room.climate, "temp": temp, "attempt": pw.attempts, "reason": reason}
         self.write_log.append(entry)
         del self.write_log[:-LOG_LIMIT]
-        _LOGGER.info("write: %s %s -> %s/heat (attempt %d) %s", room.name, room.climate, temp, pw.attempts, status.reason_text or "")
+        _LOGGER.info("write: %s %s -> %s/heat (attempt %d) %s", room.name, room.climate, temp, pw.attempts, reason or "")
 
     def _log_would_write(self, room: Any, setpoint: float | None, mode: str | None, seg: Segment, now: datetime) -> None:
         key = (seg.temp, seg.reason_code)
@@ -606,6 +637,7 @@ class HeatingEngine:
             "rooms": len(self.config.rooms),
             "rooms_in_control": sum(1 for r in self.config.rooms if r.control),
             "rooms_observing": sum(1 for r in self.config.rooms if not r.control),
+            "boosts_active": len(self.state.boosts),
             "problems": [p.to_dict() for p in self.problems],
             "problem_count": len(self.problems),
         }

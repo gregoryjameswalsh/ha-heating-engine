@@ -229,6 +229,10 @@ class Boost:
     temp: float
     until: datetime  # aware
     start: datetime | None = None  # aware; None means "since before the window"
+    # The setpoint the valve held before the boost. Set for a room in observe
+    # mode, where a boost is the one thing the engine writes: when the boost
+    # ends the engine puts this value back instead of its own schedule target.
+    restore_temp: float | None = None
 
 
 @dataclass(frozen=True)

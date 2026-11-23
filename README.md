@@ -82,6 +82,17 @@ Websocket commands (send them over the normal Home Assistant websocket):
 | `heating_engine/plan` | `{start, end}` ISO datetimes, at most 15 days | `{segments: [...]}` |
 | `heating_engine/log` | none | the would-write log, writes sent, and every change the engine did not make |
 
+REST, for clients that cannot open a websocket (same contract, Home Assistant
+bearer-token auth): `GET /api/heating_engine/state` (rooms, people, boosts,
+exceptions and health in one call), `GET` and `POST /api/heating_engine/config`,
+`GET /api/heating_engine/plan?start=&end=`, `GET /api/heating_engine/log`.
+Boosts and exceptions go through the ordinary service endpoints, for example
+`POST /api/services/heating_engine/boost`.
+
+A boost writes to the valve even while the room is only observing: it is an
+explicit, time-bounded request. For an observing room the engine puts back the
+setpoint the valve held before the boost when it ends.
+
 Services: `heating_engine.boost` (`room`, optional `temp`, optional `minutes`),
 `heating_engine.cancel_boost` (`room`), `heating_engine.set_exception`
 (`person`, `night`, `here`), `heating_engine.clear_exception` (`person`, `night`).

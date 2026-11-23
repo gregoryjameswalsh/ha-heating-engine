@@ -30,7 +30,6 @@ def ws_get_config(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
     connection.send_result(msg["id"], {"config": engine.config.to_dict(), "rev": engine.config.rev, "api_version": API_VERSION})
 
 
-@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): WS_SET_CONFIG,

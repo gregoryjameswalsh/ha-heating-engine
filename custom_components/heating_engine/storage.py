@@ -53,6 +53,7 @@ class StateStore:
                     temp=float(b["temp"]),
                     until=datetime.fromisoformat(b["until"]),
                     start=datetime.fromisoformat(b["start"]) if b.get("start") else None,
+                    restore_temp=float(b["restore_temp"]) if b.get("restore_temp") is not None else None,
                 )
             except (KeyError, ValueError, TypeError):
                 continue
@@ -68,7 +69,7 @@ class StateStore:
         await self._store.async_save(
             {
                 "boosts": [
-                    {"room": b.room, "temp": b.temp, "until": b.until.isoformat(), "start": b.start.isoformat() if b.start else None}
+                    {"room": b.room, "temp": b.temp, "until": b.until.isoformat(), "start": b.start.isoformat() if b.start else None, "restore_temp": b.restore_temp}
                     for b in state.boosts.values()
                 ],
                 "overrides": [{"room": o.room, "temp": o.temp, "since": o.since.isoformat()} for o in state.overrides.values()],

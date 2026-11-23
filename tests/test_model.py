@@ -46,6 +46,15 @@ def test_from_dict_tolerates_missing_optional_keys():
     assert cfg.rooms[0].schedule["mon"] == []
 
 
+def test_boost_carries_an_optional_restore_temp():
+    from heating_core import Boost
+
+    b = Boost(room="r", temp=21.0, until=L(2026, 1, 5, 19), start=L(2026, 1, 5, 18, 45))
+    assert b.restore_temp is None
+    b2 = Boost(room="r", temp=21.0, until=L(2026, 1, 5, 19), restore_temp=17.5)
+    assert b2.restore_temp == 17.5
+
+
 def test_segment_to_dict_is_json_friendly():
     s = Segment(room="r", start=L(2026, 1, 5, 6, 30), end=L(2026, 1, 5, 8), temp=19.0, rule=7, reason_code="warm", reason_text="Warm until 08:00", until=L(2026, 1, 5, 8))
     d = s.to_dict()

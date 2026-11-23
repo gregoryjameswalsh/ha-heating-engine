@@ -11,7 +11,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from . import websocket
+from . import http_views, websocket
 from .const import DOMAIN
 from .engine import HeatingEngine
 from .services import async_register_services, async_unregister_services
@@ -30,6 +30,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: HeatingEngineConfigEntry
     hass.data.setdefault(DOMAIN, {})["engine"] = engine
 
     websocket.async_register(hass)
+    http_views.async_register_views(hass)
     async_register_services(hass, engine)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
