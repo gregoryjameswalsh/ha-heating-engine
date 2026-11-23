@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip pytest tzdata
+      - run: python -m pytest -q
+      - name: byte-compile the integration
+        run: python -m compileall -q custom_components/heating_engine
+      - name: manifest and hacs.json are valid JSON with a version
+        run: |
+          python - <<'EOF'
+          import json
+          m = json.load(open("custom_components/heating_engine/manifest.json"))
+          h = json.load(open("hacs.json"))
+          assert m["domain"] == "heating_engine" and m["version"], m
+          assert h["name"], h
+          print("manifest", m["version"], "| hacs.json ok")
+          EOF
