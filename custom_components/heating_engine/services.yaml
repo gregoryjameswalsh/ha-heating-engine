@@ -23,6 +23,12 @@ boost:
           max: 720
           step: 5
           unit_of_measurement: min
+    source:
+      required: false
+      example: heating_page
+      selector:
+        text:
+
 
 cancel_boost:
   fields:
@@ -31,6 +37,12 @@ cancel_boost:
       example: blue_room
       selector:
         text:
+    source:
+      required: false
+      example: heating_page
+      selector:
+        text:
+
 
 hold:
   fields:
@@ -63,6 +75,12 @@ hold:
       example: next_change
       selector:
         text:
+    source:
+      required: false
+      example: heating_page
+      selector:
+        text:
+
 
 cancel_hold:
   fields:
@@ -71,6 +89,12 @@ cancel_hold:
       example: blue_room
       selector:
         text:
+    source:
+      required: false
+      example: heating_page
+      selector:
+        text:
+
 
 set_exception:
   fields:
@@ -88,6 +112,12 @@ set_exception:
       required: true
       selector:
         boolean:
+    source:
+      required: false
+      example: heating_page
+      selector:
+        text:
+
 
 clear_exception:
   fields:
@@ -101,3 +131,8 @@ clear_exception:
       example: "2026-01-08"
       selector:
         date:
+    source:
+      required: false
+      example: heating_page
+      selector:
+        text:

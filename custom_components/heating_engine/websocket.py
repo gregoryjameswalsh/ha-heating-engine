@@ -1,6 +1,7 @@
 """Websocket commands (plan section 8.5) plus one read-only extra, `heating_engine/log`,
-which returns the would-write log, the writes sent and every change the engine
-did not make. That is how the observe phase is read without grepping log files."""
+which returns the would-write log, the writes sent, every change the engine
+did not make and every request accepted. That is how the observe phase is read
+without grepping log files."""
 from __future__ import annotations
 
 from datetime import timedelta
@@ -35,6 +36,7 @@ def ws_get_config(hass: HomeAssistant, connection: websocket_api.ActiveConnectio
         vol.Required("type"): WS_SET_CONFIG,
         vol.Required("config"): dict,
         vol.Required("base_rev"): vol.Coerce(int),
+        vol.Optional("source"): vol.All(str, vol.Match(r"^[a-z_]{1,32}$")),  # who is asking, for the activity log
     }
 )
 @websocket_api.async_response
@@ -43,8 +45,9 @@ async def ws_set_config(hass: HomeAssistant, connection: websocket_api.ActiveCon
     if engine is None:
         connection.send_error(msg["id"], "not_loaded", "The heating engine is not loaded")
         return
+    user = connection.user.name if connection.user is not None else None
     try:
-        rev = await engine.async_set_config(msg["config"], msg["base_rev"])
+        rev = await engine.async_set_config(msg["config"], msg["base_rev"], source=msg.get("source"), user=user)
     except RevConflict as exc:
         connection.send_error(msg["id"], "rev_conflict", f"Someone else saved first (the config is now rev {exc.current_rev}). Reload and try again.")
         return

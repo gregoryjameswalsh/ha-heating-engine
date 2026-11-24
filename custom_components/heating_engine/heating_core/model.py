@@ -241,6 +241,9 @@ class Boost:
     # mode, where a boost is the one thing the engine writes: when the boost
     # ends the engine puts this value back instead of its own schedule target.
     restore_temp: float | None = None
+    # who asked: a short tag the caller sent (the heating page sends
+    # `heating_page`), None for a call that sent none. Copied to the writes it causes.
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +266,8 @@ class Hold:
     # As for a boost: the setpoint the valve held before the hold, for a room in
     # observe mode, put back when the hold ends.
     restore_temp: float | None = None
+    # who asked, as for a boost
+    source: str | None = None
 
     def target(self, room: Room) -> float:
         if self.kind == "frost":
@@ -279,6 +284,7 @@ class Hold:
             "target": self.target(room),
             "until": self.until.isoformat() if self.until else None,
             "set_at": self.set_at.isoformat(),
+            "source": self.source,
         }
 
 

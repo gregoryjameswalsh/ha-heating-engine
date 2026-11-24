@@ -4,13 +4,17 @@ Same contract as the websocket commands, under /api/heating_engine/*, behind
 Home Assistant's normal bearer-token auth. Any authenticated user may read and
 write; the household decides who gets a token.
 
-  GET  /api/heating_engine/state            everything a status page needs in one call
+  GET  /api/heating_engine/state            everything a status page needs in one call (with `features`)
   GET  /api/heating_engine/config           {config, rev, api_version}
-  POST /api/heating_engine/config           {config, base_rev} -> {rev}; 409 rev_conflict, 400 invalid_config
+  POST /api/heating_engine/config           {config, base_rev, source?} -> {rev}; 409 rev_conflict, 400 invalid_config
   GET  /api/heating_engine/plan?start=&end= {segments}
-  GET  /api/heating_engine/log              would-writes, writes, unexpected changes
-  POST /api/heating_engine/hold             {room, kind, temp?, until?} -> {room: <room state>, hold}
-  POST /api/heating_engine/cancel-hold      {room} -> {room: <room state>, hold: null}
+  GET  /api/heating_engine/log              would-writes, writes, unexpected changes, requests
+  POST /api/heating_engine/hold             {room, kind, temp?, until?, source?} -> {room: <room state>, hold}
+  POST /api/heating_engine/cancel-hold      {room, source?} -> {room: <room state>, hold: null}
+
+`source` is a short tag saying who is asking (the heating page sends
+`heating_page`); it goes in the activity log with the name of the Home Assistant
+user behind the request.
 
 Boosts and exceptions use the ordinary service endpoints:
   POST /api/services/heating_engine/boost  etc.
@@ -22,19 +26,25 @@ from http import HTTPStatus
 from typing import Any
 
 from aiohttp import web
-from homeassistant.components.http import KEY_HASS, HomeAssistantView
+from homeassistant.components.http import KEY_HASS, KEY_HASS_USER, HomeAssistantView
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .const import API_VERSION, DOMAIN, MAX_PLAN_DAYS
 from .engine import HeatingEngine, RevConflict, RoomStatus, UnknownRoom
-from .heating_core import Room
+from .heating_core import FEATURES, Room, check_source
 from .heating_core.validate import ValidationError
 
 
 def _engine(request: web.Request) -> HeatingEngine | None:
     hass: HomeAssistant = request.app[KEY_HASS]
     return hass.data.get(DOMAIN, {}).get("engine")
+
+
+def _user_name(request: web.Request) -> str | None:
+    """The name of the Home Assistant user behind the request, when there is one."""
+    user = request.get(KEY_HASS_USER)
+    return user.name if user is not None else None
 
 
 def _iso(value: Any) -> str | None:
@@ -122,6 +132,7 @@ class StateView(_View):
         return self.json(
             {
                 "api_version": API_VERSION,
+                "features": list(FEATURES),
                 "now": now.isoformat(),
                 "config_rev": engine.config.rev,
                 "healthy": engine.healthy,
@@ -129,7 +140,7 @@ class StateView(_View):
                 "rooms": rooms,
                 "people": people,
                 "boosts": [
-                    {"room": b.room, "temp": b.temp, "until": b.until.isoformat(), "start": _iso(b.start)}
+                    {"room": b.room, "temp": b.temp, "until": b.until.isoformat(), "start": _iso(b.start), "source": b.source}
                     for b in engine.state.boosts.values()
                 ],
                 "holds": [h.to_dict(r) for h in engine.state.holds.values() if (r := engine.config.room(h.room)) is not None],
@@ -156,10 +167,15 @@ class ConfigView(_View):
             body = await request.json()
             config = body["config"]
             base_rev = int(body["base_rev"])
-        except (ValueError, KeyError, TypeError):
-            return self.json_message("Body must be JSON with config and base_rev", HTTPStatus.BAD_REQUEST, message_code="bad_request")
+            raw_source = body.get("source")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self.json_message("Body must be JSON with config and base_rev, optionally source", HTTPStatus.BAD_REQUEST, message_code="bad_request")
         try:
-            rev = await engine.async_set_config(config, base_rev)
+            source = check_source(raw_source)
+        except ValidationError as exc:
+            return self.json_message("; ".join(exc.errors), HTTPStatus.BAD_REQUEST, message_code="invalid_request")
+        try:
+            rev = await engine.async_set_config(config, base_rev, source=source, user=_user_name(request))
         except RevConflict as exc:
             return self.json_message(
                 f"Someone else saved first (the config is now rev {exc.current_rev}). Reload and try again.",
@@ -200,7 +216,7 @@ class PlanView(_View):
 
 
 class HoldView(_View):
-    """POST {room, kind, temp?, until?}: the same code as the `hold` service."""
+    """POST {room, kind, temp?, until?, source?}: the same code as the `hold` service."""
 
     url = "/api/heating_engine/hold"
     name = "api:heating_engine:hold"
@@ -215,10 +231,11 @@ class HoldView(_View):
             kind = str(body["kind"])
             temp = body.get("temp")
             until = body.get("until")
+            raw_source = body.get("source")
         except (ValueError, KeyError, TypeError, AttributeError):
-            return self.json_message("Body must be JSON with room and kind, optionally temp and until", HTTPStatus.BAD_REQUEST, message_code="bad_request")
+            return self.json_message("Body must be JSON with room and kind, optionally temp, until and source", HTTPStatus.BAD_REQUEST, message_code="bad_request")
         try:
-            hold = await engine.async_hold(room_id, kind, temp, until)
+            hold = await engine.async_hold(room_id, kind, temp, until, source=check_source(raw_source), user=_user_name(request))
         except UnknownRoom as exc:
             return self.json_message(f"Unknown room: {exc}", HTTPStatus.NOT_FOUND, message_code="unknown_room")
         except ValidationError as exc:
@@ -228,7 +245,7 @@ class HoldView(_View):
 
 
 class CancelHoldView(_View):
-    """POST {room}: the same code as the `cancel_hold` service."""
+    """POST {room, source?}: the same code as the `cancel_hold` service."""
 
     url = "/api/heating_engine/cancel-hold"
     name = "api:heating_engine:cancel_hold"
@@ -240,12 +257,15 @@ class CancelHoldView(_View):
         try:
             body = await request.json()
             room_id = str(body["room"])
+            raw_source = body.get("source")
         except (ValueError, KeyError, TypeError, AttributeError):
-            return self.json_message("Body must be JSON with room", HTTPStatus.BAD_REQUEST, message_code="bad_request")
+            return self.json_message("Body must be JSON with room, optionally source", HTTPStatus.BAD_REQUEST, message_code="bad_request")
         try:
-            await engine.async_cancel_hold(room_id)
+            await engine.async_cancel_hold(room_id, source=check_source(raw_source), user=_user_name(request))
         except UnknownRoom as exc:
             return self.json_message(f"Unknown room: {exc}", HTTPStatus.NOT_FOUND, message_code="unknown_room")
+        except ValidationError as exc:
+            return self.json_message("; ".join(exc.errors), HTTPStatus.BAD_REQUEST, message_code="invalid_request")
         room = engine.config.room(room_id)
         return self.json({"room": room_entry(engine, room) if room else None, "hold": None, "api_version": API_VERSION})
 
