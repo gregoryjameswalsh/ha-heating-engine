@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from homeassistant.components.climate import (
+    ATTR_HVAC_ACTION,
     ATTR_HVAC_MODE,
     ATTR_TEMPERATURE,
     DOMAIN as CLIMATE_DOMAIN,
@@ -48,13 +49,16 @@ from .const import (
     SIGNAL_UPDATED,
 )
 from .heating_core import (
+    HOLD_KINDS,
     Boost,
     CalendarEvent,
     Config,
     EngineState,
     ExceptionNight,
+    Hold,
     ManualOverride,
     Segment,
+    next_schedule_change,
     override_end,
     person_here_tonight,
     resolve_now,
@@ -73,7 +77,7 @@ from .heating_core.apply import (
     ChangeLogEntry,
     needs_write,
 )
-from .heating_core.validate import ValidationError, parse_and_validate
+from .heating_core.validate import ValidationError, check_temp, parse_and_validate
 from .storage import ConfigStore, StateStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -118,6 +122,8 @@ class RoomStatus:
     last_write: datetime | None = None
     problem: str | None = None
     boost_until: datetime | None = None
+    hvac_action: str | None = None  # the climate entity's own hvac_action, verbatim
+    hold: Hold | None = None
 
 
 @dataclass
@@ -142,6 +148,15 @@ def _setpoint_and_mode(state: State | None) -> tuple[bool, float | None, str | N
     if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
         return False, None, None
     return True, _float_or_none(state.attributes.get(ATTR_TEMPERATURE)), state.state
+
+
+def _hvac_action(state: State | None) -> str | None:
+    """The climate entity's hvac_action (heating, idle, off...), passed through as
+    it is; None when the entity does not report one."""
+    if state is None:
+        return None
+    value = state.attributes.get(ATTR_HVAC_ACTION)
+    return str(value) if value is not None else None
 
 
 class HeatingEngine:
@@ -171,7 +186,7 @@ class HeatingEngine:
         self.would_write_log: list[dict[str, Any]] = []
         self.write_log: list[dict[str, Any]] = []
         self._last_would: dict[str, tuple[float, str | None]] = {}
-        # room id -> setpoint to put back once a boost on an observing room has ended
+        # room id -> setpoint to put back once a boost or hold on an observing room has ended
         self._restore: dict[str, float] = {}
         self._state_dirty = False
         self._lock = asyncio.Lock()
@@ -237,13 +252,16 @@ class HeatingEngine:
         old_rooms = {r.id for r in self.config.rooms}
         self.config = cfg
         await self._config_store.save(cfg)
-        # overrides and boosts for rooms that no longer exist are dropped
+        # overrides, boosts and holds for rooms that no longer exist are dropped
         for rid in list(self.state.overrides):
             if cfg.room(rid) is None:
                 del self.state.overrides[rid]
         for rid in list(self.state.boosts):
             if cfg.room(rid) is None:
                 del self.state.boosts[rid]
+        for rid in list(self.state.holds):
+            if cfg.room(rid) is None:
+                del self.state.holds[rid]
         for rid in old_rooms - {r.id for r in cfg.rooms}:
             self.rooms.pop(rid, None)
             self._last_would.pop(rid, None)
@@ -276,16 +294,9 @@ class HeatingEngine:
         now = dt_util.utcnow()
         t = float(temp) if temp is not None else room.temps.comfort
         mins = int(minutes) if minutes else DEFAULT_BOOST_MINUTES
-        # A boost is the one thing the engine writes even while a room is only
-        # observing. Remember what the valve held so it can be put back after.
-        restore: float | None = None
-        existing = self.state.boosts.get(room_id)
-        if not room.control:
-            if existing is not None and existing.restore_temp is not None:
-                restore = existing.restore_temp  # a boost extended or changed keeps the original value
-            else:
-                _avail, setpoint, _mode = _setpoint_and_mode(self.hass.states.get(room.climate))
-                restore = setpoint
+        # A boost (like a hold) is written even while a room is only observing.
+        # Remember what the valve held so it can be put back after.
+        restore = self._restore_point(room)
         self.state.boosts[room_id] = Boost(room=room_id, temp=t, until=now + timedelta(minutes=mins), start=now, restore_temp=restore)
         self._restore.pop(room_id, None)
         self._state_dirty = True
@@ -299,10 +310,100 @@ class HeatingEngine:
         boost = self.state.boosts.pop(room_id, None)
         if boost is not None:
             self._state_dirty = True
-            if not room.control and boost.restore_temp is not None:
-                self._restore[room_id] = boost.restore_temp
+            self._schedule_restore(room, boost.restore_temp)
             _LOGGER.info("Boost cancelled: %s", room.name)
         await self.async_evaluate()
+
+    async def async_hold(self, room_id: str, kind: str, temp: float | None, until: str | None) -> Hold:
+        """Set a hold from the dashboard (rule 2), replacing any hold on the room
+        and any change made at the radiator. `until` is 'next_change',
+        'indefinite' or an ISO datetime; None picks the kind's natural end."""
+        room = self.config.room(room_id)
+        if room is None:
+            raise UnknownRoom(room_id)
+        if kind not in HOLD_KINDS:
+            raise ValidationError([f"kind must be one of {', '.join(HOLD_KINDS)}"])
+        now = dt_util.utcnow()
+        hold_temp: float | None = None
+        if kind == "temp":
+            if temp is None:
+                raise ValidationError(["a temp hold needs a temp"])
+            errors: list[str] = []
+            check_temp(errors, "temp", float(temp))
+            if errors:
+                raise ValidationError(errors)
+            hold_temp = float(temp)
+        until_dt = self._hold_end(room, kind, until, now)
+        # A hold (like a boost) is written even while a room is only observing.
+        restore = self._restore_point(room)
+        hold = Hold(room=room_id, kind=kind, until=until_dt, set_at=now, temp=hold_temp, restore_temp=restore)
+        self.state.holds[room_id] = hold
+        # the dashboard's word replaces an earlier change at the radiator
+        if self.state.overrides.pop(room_id, None) is not None:
+            _LOGGER.info("Hold replaces the change made at the radiator in %s", room.name)
+        self._restore.pop(room_id, None)
+        self._state_dirty = True
+        _LOGGER.info(
+            "Hold: %s %s at %s until %s%s",
+            room.name,
+            kind,
+            hold.target(room),
+            until_dt.isoformat() if until_dt else "cancelled",
+            "" if room.control else f" (observing room; will restore {restore} after)",
+        )
+        await self.async_evaluate()
+        return hold
+
+    async def async_cancel_hold(self, room_id: str) -> None:
+        room = self.config.room(room_id)
+        if room is None:
+            raise UnknownRoom(room_id)
+        hold = self.state.holds.pop(room_id, None)
+        if hold is not None:
+            self._state_dirty = True
+            self._schedule_restore(room, hold.restore_temp)
+            _LOGGER.info("Hold cancelled: %s", room.name)
+        await self.async_evaluate()
+
+    def _hold_end(self, room: Any, kind: str, until: str | None, now: datetime) -> datetime | None:
+        """Work out when a hold ends. None = until it is cancelled."""
+        text = (str(until).strip() if until is not None else "") or ("indefinite" if kind in ("eco", "frost") else "next_change")
+        if text == "indefinite":
+            return None
+        if text == "next_change":
+            # None when the schedule never changes inside the look-ahead: hold until cancelled
+            return next_schedule_change(self.config, room, now, self.calendar_events, self._tz)
+        dt = dt_util.parse_datetime(text)
+        if dt is None:
+            raise ValidationError(["until must be 'next_change', 'indefinite' or an ISO 8601 datetime"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=self._tz)
+        dt = dt_util.as_utc(dt)
+        if dt <= now:
+            raise ValidationError(["until is in the past"])
+        return dt
+
+    def _restore_point(self, room: Any) -> float | None:
+        """For a room in observe mode: the setpoint the valve held before the
+        engine's first explicit write (boost or hold). An existing boost or hold
+        already knows it; otherwise it is what the valve shows now."""
+        if room.control:
+            return None
+        for existing in (self.state.boosts.get(room.id), self.state.holds.get(room.id)):
+            if existing is not None and existing.restore_temp is not None:
+                return existing.restore_temp
+        _avail, setpoint, _mode = _setpoint_and_mode(self.hass.states.get(room.climate))
+        return setpoint
+
+    def _schedule_restore(self, room: Any, restore_temp: float | None) -> None:
+        """A boost or hold on an observing room has ended: put the valve back,
+        unless the other kind of request is still running (it carries the same
+        restore value and will put it back when it ends)."""
+        if room.control or restore_temp is None:
+            return
+        if room.id in self.state.boosts or room.id in self.state.holds:
+            return
+        self._restore[room.id] = restore_temp
 
     async def async_set_exception(self, person_id: str, night: date, here: bool) -> None:
         person = self.config.person(person_id)
@@ -383,6 +484,8 @@ class HeatingEngine:
             status.would_write = False
             boost = self.state.boosts.get(room.id)
             status.boost_until = boost.until if boost else None
+            hold = self.state.holds.get(room.id)
+            status.hold = hold
             if boost and boost.start and now - boost.start > LONG_BOOST_NOTICE_AFTER:
                 problems.append(Problem(PROBLEM_LONG_BOOST, room.id, f"{room.name} has been boosted for over {int((now - boost.start).total_seconds() // 3600)} hours"))
 
@@ -399,6 +502,7 @@ class HeatingEngine:
             status.current_setpoint = setpoint
             status.current_mode = mode
             status.current_temperature = self._room_temperature(room, state)
+            status.hvac_action = _hvac_action(state)
 
             if not available:
                 status.confirmed = False
@@ -421,11 +525,11 @@ class HeatingEngine:
 
             status.pending_write = self.tracker.is_pending(room.climate)
 
-            # a boost on an observing room has just ended: put the valve back
+            # a boost or hold on an observing room has just ended: put the valve back
             restore = self._restore.pop(room.id, None)
             if restore is not None and not room.control:
                 if needs_write(restore, setpoint, mode):
-                    await self._write(room, restore, now, status, reason="Boost ended, back to the previous setting")
+                    await self._write(room, restore, now, status, reason="Boost or hold ended, back to the previous setting")
                     status.pending_write = True
                 self.rooms[room.id] = status
                 continue
@@ -438,8 +542,8 @@ class HeatingEngine:
                     in_flight = status.pending_write and abs(self.tracker.pending[room.climate].temp - seg.temp) <= self.tracker.tolerance
                     if in_flight:
                         pass  # written already, waiting for the valve to report it
-                    elif room.control or boost is not None:
-                        # control mode, or an explicit boost: the one write an observing room gets
+                    elif room.control or boost is not None or hold is not None:
+                        # control mode, or an explicit boost or hold: the writes an observing room gets
                         await self._write(room, seg.temp, now, status)
                         status.pending_write = True
                     else:
@@ -475,9 +579,17 @@ class HeatingEngine:
                 del self.state.boosts[rid]
                 self._state_dirty = True
                 room = self.config.room(rid)
-                if room is not None and not room.control and b.restore_temp is not None:
-                    self._restore[rid] = b.restore_temp
+                if room is not None:
+                    self._schedule_restore(room, b.restore_temp)
                 _LOGGER.info("Boost ended: %s", rid)
+        for rid, h in list(self.state.holds.items()):
+            if h.until is not None and h.until <= now:
+                del self.state.holds[rid]
+                self._state_dirty = True
+                room = self.config.room(rid)
+                if room is not None:
+                    self._schedule_restore(room, h.restore_temp)
+                _LOGGER.info("Hold ended: %s", rid)
         for rid, o in list(self.state.overrides.items()):
             room = self.config.room(rid)
             if room is None:
@@ -555,6 +667,10 @@ class HeatingEngine:
             self.changes.add(ChangeLogEntry(when=now, room=room.id, entity_id=entity_id, kind=verdict, old=old_txt, new=new_txt))
             self._state_dirty = True
             if verdict == MANUAL_SETPOINT and new_sp is not None:
+                # a hand on the radiator is the latest word: it replaces a dashboard hold
+                if self.state.holds.pop(room.id, None) is not None:
+                    self._restore.pop(room.id, None)
+                    _LOGGER.info("Change at the radiator replaces the hold in %s", room.name)
                 self.state.overrides[room.id] = ManualOverride(room=room.id, temp=new_sp, since=now)
                 _LOGGER.warning("Unexpected setpoint change in %s: %s %s -> %s (not written by the engine; holding until the next schedule change)", room.name, entity_id, old_txt, new_txt)
             else:
@@ -653,6 +769,7 @@ class HeatingEngine:
             "rooms_in_control": sum(1 for r in self.config.rooms if r.control),
             "rooms_observing": sum(1 for r in self.config.rooms if not r.control),
             "boosts_active": len(self.state.boosts),
+            "holds_active": len(self.state.holds),
             "problems": [p.to_dict() for p in self.problems],
             "problem_count": len(self.problems),
         }

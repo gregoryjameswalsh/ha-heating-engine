@@ -17,6 +17,8 @@ DEFAULT_ARRIVE = "15:00"
 DEFAULT_LEAVE = "09:00"
 DEFAULT_RETURN_PREHEAT_HOURS = 12.0
 DEFAULT_HOLIDAY_PREHEAT_HOURS = 6.0
+DEFAULT_FROST_TEMP = 5.0  # a frost-protection hold when the room sets no frost temperature
+HOLD_KINDS = ("skip", "eco", "frost", "temp")
 
 
 @dataclass(frozen=True)
@@ -40,13 +42,19 @@ class Temps:
     comfort: float
     eco: float
     empty: float
+    frost: float = DEFAULT_FROST_TEMP  # a frost-protection hold sits here
 
     def to_dict(self) -> dict[str, Any]:
-        return {"comfort": self.comfort, "eco": self.eco, "empty": self.empty}
+        return {"comfort": self.comfort, "eco": self.eco, "empty": self.empty, "frost": self.frost}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Temps:
-        return cls(comfort=float(d["comfort"]), eco=float(d["eco"]), empty=float(d["empty"]))
+        return cls(
+            comfort=float(d["comfort"]),
+            eco=float(d["eco"]),
+            empty=float(d["empty"]),
+            frost=float(d.get("frost", DEFAULT_FROST_TEMP)),
+        )
 
 
 @dataclass
@@ -236,8 +244,47 @@ class Boost:
 
 
 @dataclass(frozen=True)
+class Hold:
+    """A hold set from the dashboard (plan rule 2). Outranks a change made at
+    the radiator and the schedule; a boost still wins while it runs.
+
+    `kind` says what it holds at: `skip` and `eco` the room's Eco temperature,
+    `frost` the room's frost-protection temperature, `temp` the given `temp`.
+    Those temperatures are read from the room when the hold is resolved, so a
+    hold at Eco follows the room's Eco if the config changes under it.
+    `until` is when it ends on its own; None means until it is cancelled.
+    """
+
+    room: str
+    kind: str  # one of HOLD_KINDS
+    until: datetime | None  # aware; None = until cancelled
+    set_at: datetime  # aware
+    temp: float | None = None  # kind `temp` only
+    # As for a boost: the setpoint the valve held before the hold, for a room in
+    # observe mode, put back when the hold ends.
+    restore_temp: float | None = None
+
+    def target(self, room: Room) -> float:
+        if self.kind == "frost":
+            return room.temps.frost
+        if self.kind == "temp" and self.temp is not None:
+            return self.temp
+        return room.temps.eco  # skip, eco, or a temp hold with no temp (never stored)
+
+    def to_dict(self, room: Room) -> dict[str, Any]:
+        """The public shape, as the state API shows it."""
+        return {
+            "room": self.room,
+            "kind": self.kind,
+            "target": self.target(room),
+            "until": self.until.isoformat() if self.until else None,
+            "set_at": self.set_at.isoformat(),
+        }
+
+
+@dataclass(frozen=True)
 class ManualOverride:
-    """A setpoint the engine did not write (plan rule 2). Holds until the next
+    """A setpoint the engine did not write (plan rule 3). Holds until the next
     schedule change after `since`; the resolver works that moment out."""
 
     room: str
@@ -257,6 +304,7 @@ class CalendarEvent:
 @dataclass
 class EngineState:
     boosts: dict[str, Boost] = field(default_factory=dict)  # by room id
+    holds: dict[str, Hold] = field(default_factory=dict)  # by room id
     overrides: dict[str, ManualOverride] = field(default_factory=dict)  # by room id
 
 

@@ -169,7 +169,7 @@ def test_expired_boost_has_no_effect():
     assert all(s.reason_code != "boost" for s in segs)
 
 
-# ---- rule 2: manual change ----
+# ---- rule 3: manual change ----
 
 
 def test_manual_change_holds_until_the_next_schedule_change():
@@ -182,7 +182,7 @@ def test_manual_change_holds_until_the_next_schedule_change():
         ("Tue 21:00", "Tue 22:00", 16.0, "eco"),
     ]
     assert segs[1].reason_text == "Turned down at the radiator. Back to schedule at 21:00"
-    assert segs[1].rule == 2
+    assert segs[1].rule == 3
 
 
 def test_manual_change_during_eco_runs_to_the_next_block_tomorrow():
@@ -274,7 +274,7 @@ def test_plan_covers_every_room_contiguously_for_fourteen_days():
         assert_contiguous(segs_for(segs, r.id), start, end)
         for s in segs_for(segs, r.id):
             assert s.reason_text  # never empty
-            assert s.rule in (1, 2, 4, 5, 7, 9)
+            assert s.rule in (1, 2, 3, 4, 5, 7, 9)
 
 
 def test_resolve_now_returns_one_segment_per_room_containing_now():
