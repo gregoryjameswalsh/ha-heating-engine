@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1 — 2026-11-24
+
+- **Fix: a setpoint change that lands on the schedule's own target is no longer a manual change.** Seen live in a controlled room whose thermostat still runs its own schedule: two seconds after the engine's block edge the thermostat stepped to the very value the engine wanted, the engine filed it as `manual_setpoint`, and the room showed "Changed at the radiator" at the schedule's own temperature for the whole block. Now a change the engine did not make is compared with what the rules ask for (`matches_plan` in `heating_core/resolve.py`): the room's target now and over the next 90 seconds, in `heat` mode, with boosts and holds counted and the room's own manual change left out. A match is not a manual change, is not added to `unexpected_changes` or the health count, and is logged at info level ("matches the schedule"); the room keeps the schedule's own reason. The grace covers a device schedule that moves a few seconds before or after the engine's block edge, in either order.
+- **A manual change ends early when the radiator is put back to the schedule.** If a manual change is on and the setpoint is then changed to exactly what the schedule asks for, the manual change is dropped rather than re-asserted over the hand that just undid it.
+- **No write for a target the plan is about to switch to.** When the valve already shows the value the plan asks for within the same 90 seconds, the engine waits for the edge instead of writing the old target and the new one seconds apart.
+- Covered by tests on the pure helper: now, within the grace, two minutes early, mode and tolerance, the room's own override versus another room's, holds and boosts, a rota edge.
+
 ## v0.4.0 — 2026-11-24
 
 - **An activity log, with who asked.** Every request the engine accepts is logged whether or not it leads to a write: a boost, a cancelled boost, a hold, a cancelled hold, an exception set or cleared, a config save. `GET log` (websocket and REST) gains `requests`: oldest first, bounded at 200, each `{when, room, person, action, detail, source, user}`. `detail` is plain words ("Boost to 21° for 15 min", "Skip until 19:00", "Hold at Eco until turned back on", "Frost protection until turned back on", "Set to 18° until 19:00", "Back to the schedule", "Away on Wed 25 Nov", "Schedule or settings changed"). A cancel or clear that found nothing to do is not logged.

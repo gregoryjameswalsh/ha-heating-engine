@@ -38,7 +38,7 @@ from .model import (
 )
 from .occupancy import person_here_tonight
 from .persist import logs_from_dict, logs_to_dict, state_from_dict, state_to_dict
-from .resolve import next_schedule_change, override_end, resolve_now, resolve_plan
+from .resolve import PLAN_GRACE, matches_plan, next_schedule_change, override_end, resolve_now, resolve_plan
 from .validate import ValidationError, validate_config
 
 API_VERSION = 1
@@ -77,11 +77,13 @@ __all__ = [
     "Hold",
     "Holiday",
     "ManualOverride",
+    "PLAN_GRACE",
     "Person",
     "Room",
     "Segment",
     "Temps",
     "ValidationError",
+    "matches_plan",
     "next_schedule_change",
     "override_end",
     "person_here_tonight",

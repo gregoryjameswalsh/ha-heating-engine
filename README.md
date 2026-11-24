@@ -75,6 +75,18 @@ until cancelled.
   not make replaces the dashboard hold, and the room's reason text says so
   ("Turned up at the radiator. Back to schedule at 21:00"). Setting a hold
   likewise replaces an earlier change made at the radiator.
+- A setpoint change that lands on what the rules already ask for is not a
+  manual change. The engine compares the new setpoint (in `heat` mode) with the
+  room's target now and over the next 90 seconds, so a thermostat whose own
+  schedule still runs and steps to the same value a few seconds either side of
+  a block edge leaves the room on the schedule's own reason (`warm`, `eco`),
+  and the change is not counted as unexpected. Putting the radiator back to the
+  schedule's value while a manual change is on ends that manual change early.
+  A boost or hold counts as "what the rules ask for" here; a change made while
+  one is on and equal to its target is that boost's or hold's, not a hand on
+  the radiator. The same 90-second grace applies to writes: when the valve
+  already shows the target the plan is about to switch to, the engine waits
+  for the edge instead of writing the old target and then the new one.
 - Like a boost, a hold writes to the valve even while the room is only
   observing, and the setpoint the valve held before is put back when the hold
   ends.
@@ -228,7 +240,8 @@ Home Assistant user's name, each `null` when absent.
 
 The same lines reach the Home Assistant log (Settings, System, Logs, search
 `heating_engine`): `would write:`, `write:`, `Unexpected setpoint change`,
-`Request:`. And `sensor.heating_<room>_target` carries `would_write: true`
+`Request:`, and at info level `matches the schedule` for a change that was
+not counted as manual. And `sensor.heating_<room>_target` carries `would_write: true`
 while an observing room's valve differs from the target.
 
 ## Config document
