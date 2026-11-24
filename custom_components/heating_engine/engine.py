@@ -49,6 +49,7 @@ from .const import (
     SIGNAL_UPDATED,
 )
 from .heating_core import (
+    CONFIG_DETAIL,
     HOLD_KINDS,
     Boost,
     CalendarEvent,
@@ -57,14 +58,35 @@ from .heating_core import (
     ExceptionNight,
     Hold,
     ManualOverride,
+    Request,
+    RequestLog,
     Segment,
+    boost_detail,
+    cancel_boost_detail,
+    cancel_hold_detail,
+    clear_exception_detail,
+    exception_detail,
+    hold_detail,
     next_schedule_change,
     override_end,
     person_here_tonight,
     resolve_now,
     resolve_plan,
+    write_cause,
 )
 from .calendar_read import read_calendar
+from .heating_core.activity import (
+    ACTION_BOOST,
+    ACTION_CANCEL_BOOST,
+    ACTION_CANCEL_HOLD,
+    ACTION_CLEAR_EXCEPTION,
+    ACTION_CONFIG,
+    ACTION_HOLD,
+    ACTION_SET_EXCEPTION,
+    CAUSE_BOOST,
+    CAUSE_HOLD,
+    CAUSE_RESTORE,
+)
 from .heating_core.apply import (
     FAILED,
     HEAT,
@@ -79,7 +101,7 @@ from .heating_core.apply import (
     needs_write,
 )
 from .heating_core.validate import ValidationError, check_temp, parse_and_validate
-from .storage import ConfigStore, StateStore
+from .storage import ConfigStore, StateStore, StoredState
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -187,9 +209,11 @@ class HeatingEngine:
         self.problems: list[Problem] = []
         self.would_write_log: list[dict[str, Any]] = []
         self.write_log: list[dict[str, Any]] = []
+        self.requests = RequestLog(limit=LOG_LIMIT)  # every accepted request, with who asked
         self._last_would: dict[str, tuple[float, str | None]] = {}
-        # room id -> setpoint to put back once a boost or hold on an observing room has ended
-        self._restore: dict[str, float] = {}
+        # room id -> (setpoint to put back once a boost or hold on an observing room
+        # has ended, the source of that boost or hold)
+        self._restore: dict[str, tuple[float, str | None]] = {}
         self._state_dirty = False
         self._lock = asyncio.Lock()
         self._unsub: list[Callable[[], None]] = []
@@ -201,7 +225,13 @@ class HeatingEngine:
     async def async_start(self) -> None:
         today = dt_util.now().date()
         self.config = await self._config_store.load(today)
-        self.state, self.changes, self.calendar_events = await self._state_store.load()
+        stored = await self._state_store.load()
+        self.state = stored.state
+        self.changes = stored.changes
+        self.calendar_events = stored.calendars
+        self.would_write_log = stored.would_write
+        self.write_log = stored.writes
+        self.requests = stored.requests
         if self.calendar_events:
             self.calendar_ok = None  # last known, not yet confirmed this run
             _LOGGER.info("Using the last known calendar events (%s) until the first read succeeds", ", ".join(self.calendar_events))
@@ -225,7 +255,35 @@ class HeatingEngine:
         if self._unsub_states:
             self._unsub_states()
             self._unsub_states = None
-        await self._state_store.save(self.state, self.changes, self.calendar_events)
+        await self._save_state()
+
+    async def _save_state(self) -> None:
+        await self._state_store.save(
+            StoredState(
+                state=self.state,
+                changes=self.changes,
+                calendars=self.calendar_events,
+                would_write=self.would_write_log,
+                writes=self.write_log,
+                requests=self.requests,
+            )
+        )
+
+    def _record_request(
+        self,
+        now: datetime,
+        action: str,
+        detail: str,
+        *,
+        room: str | None = None,
+        person: str | None = None,
+        source: str | None = None,
+        user: str | None = None,
+    ) -> None:
+        """Every accepted request goes in the activity log, write or no write."""
+        self.requests.add(Request(when=now, action=action, detail=detail, room=room, person=person, source=source, user=user))
+        self._state_dirty = True
+        _LOGGER.info("Request: %s %s %s (source %s, user %s)", action, room or person or "", detail, source or "-", user or "-")
 
     def _subscribe_states(self) -> None:
         if self._unsub_states:
@@ -241,12 +299,13 @@ class HeatingEngine:
 
     # ------------------------------------------------------------------ config
 
-    async def async_set_config(self, raw: dict[str, Any], base_rev: int) -> int:
+    async def async_set_config(self, raw: dict[str, Any], base_rev: int, *, source: str | None = None, user: str | None = None) -> int:
         """Replace the whole document. Rejects a stale base_rev or an invalid document."""
         if base_rev != self.config.rev:
             raise RevConflict(self.config.rev)
         cfg = parse_and_validate(raw)  # raises ValidationError with every message
         cfg.rev = base_rev + 1
+        self._record_request(dt_util.utcnow(), ACTION_CONFIG, CONFIG_DETAIL, source=source, user=user)
         await self._adopt_config(cfg)
         return cfg.rev
 
@@ -289,7 +348,7 @@ class HeatingEngine:
 
     # ------------------------------------------------------------------ services
 
-    async def async_boost(self, room_id: str, temp: float | None, minutes: int | None) -> None:
+    async def async_boost(self, room_id: str, temp: float | None, minutes: int | None, *, source: str | None = None, user: str | None = None) -> None:
         room = self.config.room(room_id)
         if room is None:
             raise UnknownRoom(room_id)
@@ -299,24 +358,35 @@ class HeatingEngine:
         # A boost (like a hold) is written even while a room is only observing.
         # Remember what the valve held so it can be put back after.
         restore = self._restore_point(room)
-        self.state.boosts[room_id] = Boost(room=room_id, temp=t, until=now + timedelta(minutes=mins), start=now, restore_temp=restore)
+        self.state.boosts[room_id] = Boost(room=room_id, temp=t, until=now + timedelta(minutes=mins), start=now, restore_temp=restore, source=source)
         self._restore.pop(room_id, None)
         self._state_dirty = True
         _LOGGER.info("Boost: %s to %s for %d min%s", room.name, t, mins, "" if room.control else f" (observing room; will restore {restore} after)")
+        self._record_request(now, ACTION_BOOST, boost_detail(t, mins), room=room_id, source=source, user=user)
         await self.async_evaluate()
 
-    async def async_cancel_boost(self, room_id: str) -> None:
+    async def async_cancel_boost(self, room_id: str, *, source: str | None = None, user: str | None = None) -> None:
         room = self.config.room(room_id)
         if room is None:
             raise UnknownRoom(room_id)
         boost = self.state.boosts.pop(room_id, None)
         if boost is not None:
             self._state_dirty = True
-            self._schedule_restore(room, boost.restore_temp)
+            self._schedule_restore(room, boost.restore_temp, boost.source)
             _LOGGER.info("Boost cancelled: %s", room.name)
+            self._record_request(dt_util.utcnow(), ACTION_CANCEL_BOOST, cancel_boost_detail(room_id in self.state.holds), room=room_id, source=source, user=user)
         await self.async_evaluate()
 
-    async def async_hold(self, room_id: str, kind: str, temp: float | None, until: str | None) -> Hold:
+    async def async_hold(
+        self,
+        room_id: str,
+        kind: str,
+        temp: float | None,
+        until: str | None,
+        *,
+        source: str | None = None,
+        user: str | None = None,
+    ) -> Hold:
         """Set a hold from the dashboard (rule 2), replacing any hold on the room
         and any change made at the radiator. `until` is 'next_change',
         'indefinite' or an ISO datetime; None picks the kind's natural end."""
@@ -338,7 +408,7 @@ class HeatingEngine:
         until_dt = self._hold_end(room, kind, until, now)
         # A hold (like a boost) is written even while a room is only observing.
         restore = self._restore_point(room)
-        hold = Hold(room=room_id, kind=kind, until=until_dt, set_at=now, temp=hold_temp, restore_temp=restore)
+        hold = Hold(room=room_id, kind=kind, until=until_dt, set_at=now, temp=hold_temp, restore_temp=restore, source=source)
         self.state.holds[room_id] = hold
         # the dashboard's word replaces an earlier change at the radiator
         if self.state.overrides.pop(room_id, None) is not None:
@@ -353,18 +423,20 @@ class HeatingEngine:
             until_dt.isoformat() if until_dt else "cancelled",
             "" if room.control else f" (observing room; will restore {restore} after)",
         )
+        self._record_request(now, ACTION_HOLD, hold_detail(kind, hold.target(room), until_dt, now, self._tz), room=room_id, source=source, user=user)
         await self.async_evaluate()
         return hold
 
-    async def async_cancel_hold(self, room_id: str) -> None:
+    async def async_cancel_hold(self, room_id: str, *, source: str | None = None, user: str | None = None) -> None:
         room = self.config.room(room_id)
         if room is None:
             raise UnknownRoom(room_id)
         hold = self.state.holds.pop(room_id, None)
         if hold is not None:
             self._state_dirty = True
-            self._schedule_restore(room, hold.restore_temp)
+            self._schedule_restore(room, hold.restore_temp, hold.source)
             _LOGGER.info("Hold cancelled: %s", room.name)
+            self._record_request(dt_util.utcnow(), ACTION_CANCEL_HOLD, cancel_hold_detail(room_id in self.state.boosts), room=room_id, source=source, user=user)
         await self.async_evaluate()
 
     def _hold_end(self, room: Any, kind: str, until: str | None, now: datetime) -> datetime | None:
@@ -397,17 +469,18 @@ class HeatingEngine:
         _avail, setpoint, _mode = _setpoint_and_mode(self.hass.states.get(room.climate))
         return setpoint
 
-    def _schedule_restore(self, room: Any, restore_temp: float | None) -> None:
+    def _schedule_restore(self, room: Any, restore_temp: float | None, source: str | None = None) -> None:
         """A boost or hold on an observing room has ended: put the valve back,
         unless the other kind of request is still running (it carries the same
-        restore value and will put it back when it ends)."""
+        restore value and will put it back when it ends). The restore write is
+        filed under the source of the boost or hold that ended."""
         if room.control or restore_temp is None:
             return
         if room.id in self.state.boosts or room.id in self.state.holds:
             return
-        self._restore[room.id] = restore_temp
+        self._restore[room.id] = (restore_temp, source)
 
-    async def async_set_exception(self, person_id: str, night: date, here: bool) -> None:
+    async def async_set_exception(self, person_id: str, night: date, here: bool, *, source: str | None = None, user: str | None = None) -> None:
         person = self.config.person(person_id)
         if person is None:
             raise UnknownPerson(person_id)
@@ -416,14 +489,16 @@ class HeatingEngine:
         self.config.exceptions = [e for e in self.config.exceptions if not (e.person == person_id and e.night == night)]
         self.config.exceptions.append(ExceptionNight(person=person_id, night=night, here=here))
         _LOGGER.info("Exception: %s %s on %s", person.name, "here" if here else "away", night.isoformat())
+        self._record_request(dt_util.utcnow(), ACTION_SET_EXCEPTION, exception_detail(here, night), person=person_id, source=source, user=user)
         await self._bump_config()
 
-    async def async_clear_exception(self, person_id: str, night: date) -> None:
+    async def async_clear_exception(self, person_id: str, night: date, *, source: str | None = None, user: str | None = None) -> None:
         if self.config.person(person_id) is None:
             raise UnknownPerson(person_id)
         before = len(self.config.exceptions)
         self.config.exceptions = [e for e in self.config.exceptions if not (e.person == person_id and e.night == night)]
         if len(self.config.exceptions) != before:
+            self._record_request(dt_util.utcnow(), ACTION_CLEAR_EXCEPTION, clear_exception_detail(night), person=person_id, source=source, user=user)
             await self._bump_config()
 
     # ------------------------------------------------------------------ plan
@@ -454,7 +529,7 @@ class HeatingEngine:
                 if self._state_dirty:
                     self._state_dirty = False
                     try:
-                        await self._state_store.save(self.state, self.changes, self.calendar_events)
+                        await self._save_state()
                     except Exception:  # noqa: BLE001
                         _LOGGER.exception("Could not save runtime state")
                 async_dispatcher_send(self.hass, SIGNAL_UPDATED)
@@ -523,15 +598,25 @@ class HeatingEngine:
             elif outcome == RETRY and seg is not None:
                 pending = self.tracker.pending[room.climate]
                 _LOGGER.warning("Retrying write to %s (%s): attempt %d", room.name, room.climate, pending.attempts + 1)
-                await self._write(room, pending.temp, now, status)
+                cause, source = self._cause_and_source(room, status.reason_code)
+                await self._write(room, pending.temp, now, status, cause=cause, source=source)
 
             status.pending_write = self.tracker.is_pending(room.climate)
 
             # a boost or hold on an observing room has just ended: put the valve back
             restore = self._restore.pop(room.id, None)
             if restore is not None and not room.control:
-                if needs_write(restore, setpoint, mode):
-                    await self._write(room, restore, now, status, reason="Boost or hold ended, back to the previous setting")
+                restore_temp, restore_source = restore
+                if needs_write(restore_temp, setpoint, mode):
+                    await self._write(
+                        room,
+                        restore_temp,
+                        now,
+                        status,
+                        reason="Boost or hold ended, back to the previous setting",
+                        cause=CAUSE_RESTORE,
+                        source=restore_source,
+                    )
                     status.pending_write = True
                 self.rooms[room.id] = status
                 continue
@@ -546,7 +631,8 @@ class HeatingEngine:
                         pass  # written already, waiting for the valve to report it
                     elif room.control or boost is not None or hold is not None:
                         # control mode, or an explicit boost or hold: the writes an observing room gets
-                        await self._write(room, seg.temp, now, status)
+                        cause, source = self._cause_and_source(room, seg.reason_code)
+                        await self._write(room, seg.temp, now, status, cause=cause, source=source)
                         status.pending_write = True
                     else:
                         status.would_write = True
@@ -582,7 +668,7 @@ class HeatingEngine:
                 self._state_dirty = True
                 room = self.config.room(rid)
                 if room is not None:
-                    self._schedule_restore(room, b.restore_temp)
+                    self._schedule_restore(room, b.restore_temp, b.source)
                 _LOGGER.info("Boost ended: %s", rid)
         for rid, h in list(self.state.holds.items()):
             if h.until is not None and h.until <= now:
@@ -590,7 +676,7 @@ class HeatingEngine:
                 self._state_dirty = True
                 room = self.config.room(rid)
                 if room is not None:
-                    self._schedule_restore(room, h.restore_temp)
+                    self._schedule_restore(room, h.restore_temp, h.source)
                 _LOGGER.info("Hold ended: %s", rid)
         for rid, o in list(self.state.overrides.items()):
             room = self.config.room(rid)
@@ -606,10 +692,30 @@ class HeatingEngine:
 
     # ------------------------------------------------------------------ writes
 
-    async def _write(self, room: Any, temp: float, now: datetime, status: RoomStatus, reason: str | None = None) -> None:
+    def _cause_and_source(self, room: Any, reason_code: str | None) -> tuple[str, str | None]:
+        """What a write to match the resolved target is for, and who asked for
+        it: the source of the boost or hold behind it, else None."""
+        cause = write_cause(reason_code)
+        if cause == CAUSE_BOOST and (boost := self.state.boosts.get(room.id)) is not None:
+            return cause, boost.source
+        if cause == CAUSE_HOLD and (hold := self.state.holds.get(room.id)) is not None:
+            return cause, hold.source
+        return cause, None
+
+    async def _write(
+        self,
+        room: Any,
+        temp: float,
+        now: datetime,
+        status: RoomStatus,
+        reason: str | None = None,
+        cause: str | None = None,
+        source: str | None = None,
+    ) -> None:
         """Send mode heat + temperature, record it as pending, remember it as ours
         on the written entity and on every watched device in the room."""
         reason = reason or status.reason_text
+        cause = cause or write_cause(status.reason_code)
         data = {ATTR_ENTITY_ID: room.climate, ATTR_TEMPERATURE: temp, ATTR_HVAC_MODE: HEAT}
         # Record the expectation BEFORE the call. A blocking climate call returns
         # only after the device reports back, and that report is a state change
@@ -626,10 +732,20 @@ class HeatingEngine:
             _LOGGER.warning("Write to %s (%s) raised %s; will read back and retry", room.name, room.climate, exc)
         self.writes_sent += 1
         status.last_write = now
-        entry = {"when": now.isoformat(), "room": room.id, "entity_id": room.climate, "temp": temp, "attempt": pw.attempts, "reason": reason}
+        entry = {
+            "when": now.isoformat(),
+            "room": room.id,
+            "entity_id": room.climate,
+            "temp": temp,
+            "attempt": pw.attempts,
+            "reason": reason,
+            "cause": cause,
+            "source": source,
+        }
         self.write_log.append(entry)
         del self.write_log[:-LOG_LIMIT]
-        _LOGGER.info("write: %s %s -> %s/heat (attempt %d) %s", room.name, room.climate, temp, pw.attempts, reason or "")
+        self._state_dirty = True  # the write log survives a restart
+        _LOGGER.info("write: %s %s -> %s/heat (attempt %d) %s [%s%s]", room.name, room.climate, temp, pw.attempts, reason or "", cause, f", {source}" if source else "")
 
     def _log_would_write(self, room: Any, setpoint: float | None, mode: str | None, seg: Segment, now: datetime) -> None:
         key = (seg.temp, seg.reason_code)
@@ -647,6 +763,7 @@ class HeatingEngine:
         }
         self.would_write_log.append(entry)
         del self.would_write_log[:-LOG_LIMIT]
+        self._state_dirty = True  # the would-write log survives a restart
         _LOGGER.info("would write: %s %s %s/%s -> %s/heat (%s)", room.name, room.climate, setpoint, mode, seg.temp, seg.reason_text)
 
     # ------------------------------------------------------------------ changes we did not make
@@ -770,4 +887,5 @@ class HeatingEngine:
             "would_write": list(self.would_write_log),
             "writes": list(self.write_log),
             "unexpected_changes": self.changes.to_list(),
+            "requests": self.requests.to_list(),
         }

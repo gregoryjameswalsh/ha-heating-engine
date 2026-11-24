@@ -15,50 +15,116 @@
       "name": "Boost",
       "description": "Hold a room at a temperature for a while.",
       "fields": {
-        "room": { "name": "Room", "description": "The room id from the config document." },
-        "temp": { "name": "Temperature", "description": "Target in degrees. Defaults to the room's comfort temperature." },
-        "minutes": { "name": "Minutes", "description": "How long. Defaults to 60." }
+        "room": {
+          "name": "Room",
+          "description": "The room id from the config document."
+        },
+        "temp": {
+          "name": "Temperature",
+          "description": "Target in degrees. Defaults to the room's comfort temperature."
+        },
+        "minutes": {
+          "name": "Minutes",
+          "description": "How long. Defaults to 60."
+        },
+        "source": {
+          "name": "Source",
+          "description": "Who is asking: a short tag such as heating_page, shown in the activity log. Letters a-z and _ only."
+        }
       }
     },
     "cancel_boost": {
       "name": "Cancel boost",
       "description": "End a room's boost now.",
       "fields": {
-        "room": { "name": "Room", "description": "The room id from the config document." }
+        "room": {
+          "name": "Room",
+          "description": "The room id from the config document."
+        },
+        "source": {
+          "name": "Source",
+          "description": "Who is asking: a short tag such as heating_page, shown in the activity log. Letters a-z and _ only."
+        }
       }
     },
     "hold": {
       "name": "Hold",
       "description": "Hold a room at Eco, at frost protection or at a temperature, until the next scheduled change, until cancelled, or until a time.",
       "fields": {
-        "room": { "name": "Room", "description": "The room id from the config document." },
-        "kind": { "name": "Kind", "description": "skip (Eco until the next scheduled change), eco (Eco until cancelled), frost (frost protection until cancelled) or temp (a temperature until the next scheduled change)." },
-        "temp": { "name": "Temperature", "description": "Target in degrees, half-degree steps. Only for kind temp." },
-        "until": { "name": "Until", "description": "next_change, indefinite, or an ISO 8601 datetime. Defaults to the kind's own end." }
+        "room": {
+          "name": "Room",
+          "description": "The room id from the config document."
+        },
+        "kind": {
+          "name": "Kind",
+          "description": "skip (Eco until the next scheduled change), eco (Eco until cancelled), frost (frost protection until cancelled) or temp (a temperature until the next scheduled change)."
+        },
+        "temp": {
+          "name": "Temperature",
+          "description": "Target in degrees, half-degree steps. Only for kind temp."
+        },
+        "until": {
+          "name": "Until",
+          "description": "next_change, indefinite, or an ISO 8601 datetime. Defaults to the kind's own end."
+        },
+        "source": {
+          "name": "Source",
+          "description": "Who is asking: a short tag such as heating_page, shown in the activity log. Letters a-z and _ only."
+        }
       }
     },
     "cancel_hold": {
       "name": "Cancel hold",
       "description": "End a room's hold now.",
       "fields": {
-        "room": { "name": "Room", "description": "The room id from the config document." }
+        "room": {
+          "name": "Room",
+          "description": "The room id from the config document."
+        },
+        "source": {
+          "name": "Source",
+          "description": "Who is asking: a short tag such as heating_page, shown in the activity log. Letters a-z and _ only."
+        }
       }
     },
     "set_exception": {
       "name": "Set exception",
       "description": "Mark whether a person sleeps here on one night, overriding the rota.",
       "fields": {
-        "person": { "name": "Person", "description": "The person id from the config document." },
-        "night": { "name": "Night", "description": "The date of the night, YYYY-MM-DD." },
-        "here": { "name": "Here", "description": "True if they sleep here that night." }
+        "person": {
+          "name": "Person",
+          "description": "The person id from the config document."
+        },
+        "night": {
+          "name": "Night",
+          "description": "The date of the night, YYYY-MM-DD."
+        },
+        "here": {
+          "name": "Here",
+          "description": "True if they sleep here that night."
+        },
+        "source": {
+          "name": "Source",
+          "description": "Who is asking: a short tag such as heating_page, shown in the activity log. Letters a-z and _ only."
+        }
       }
     },
     "clear_exception": {
       "name": "Clear exception",
       "description": "Remove a one-night exception so the rota applies again.",
       "fields": {
-        "person": { "name": "Person", "description": "The person id from the config document." },
-        "night": { "name": "Night", "description": "The date of the night, YYYY-MM-DD." }
+        "person": {
+          "name": "Person",
+          "description": "The person id from the config document."
+        },
+        "night": {
+          "name": "Night",
+          "description": "The date of the night, YYYY-MM-DD."
+        },
+        "source": {
+          "name": "Source",
+          "description": "Who is asking: a short tag such as heating_page, shown in the activity log. Letters a-z and _ only."
+        }
       }
     }
   }

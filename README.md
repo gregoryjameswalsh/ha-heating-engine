@@ -112,6 +112,8 @@ days are covered by tests.
   times before a warning is raised.
 - Every setpoint change the engine did not make is logged and counted on the
   health sensor.
+- Every request the engine accepts (a boost, a hold, an exception, a config
+  save) is logged with who asked, whether or not it led to a write.
 - A health sensor carries a heartbeat; something outside the integration should
   watch it and shout if it goes stale.
 
@@ -122,21 +124,27 @@ Websocket commands (send them over the normal Home Assistant websocket):
 | Command | Payload | Returns |
 |---|---|---|
 | `heating_engine/get_config` | none | `{config, rev, api_version}` |
-| `heating_engine/set_config` | `{config, base_rev}` | `{rev}`, or error `rev_conflict` / `invalid_config` with a plain message |
+| `heating_engine/set_config` | `{config, base_rev, source?}` | `{rev}`, or error `rev_conflict` / `invalid_config` with a plain message |
 | `heating_engine/plan` | `{start, end}` ISO datetimes, at most 15 days | `{segments: [...]}` |
-| `heating_engine/log` | none | the would-write log, writes sent, and every change the engine did not make |
+| `heating_engine/log` | none | the would-write log, writes sent, every change the engine did not make, and every request accepted |
 
 REST, for clients that cannot open a websocket (same contract, Home Assistant
 bearer-token auth):
 
 | Route | Returns |
 |---|---|
-| `GET /api/heating_engine/state` | rooms, people, boosts, holds, exceptions and health in one call |
-| `GET` / `POST /api/heating_engine/config` | as the websocket `get_config` / `set_config` |
+| `GET /api/heating_engine/state` | rooms, people, boosts, holds, exceptions, health and `features` in one call |
+| `GET` / `POST /api/heating_engine/config` | as the websocket `get_config` / `set_config` (`POST` body `{config, base_rev, source?}`) |
 | `GET /api/heating_engine/plan?start=&end=` | `{segments}` |
 | `GET /api/heating_engine/log` | as the websocket `log` |
-| `POST /api/heating_engine/hold` `{room, kind, temp?, until?}` | `{room: <that room's state entry>, hold}`; 400 `invalid_request`, 404 `unknown_room` |
-| `POST /api/heating_engine/cancel-hold` `{room}` | `{room: <that room's state entry>, hold: null}` |
+| `POST /api/heating_engine/hold` `{room, kind, temp?, until?, source?}` | `{room: <that room's state entry>, hold}`; 400 `invalid_request`, 404 `unknown_room` |
+| `POST /api/heating_engine/cancel-hold` `{room, source?}` | `{room: <that room's state entry>, hold: null}` |
+
+`features` in `state` is a list of what this engine can do beyond the first
+shape of `api_version` 1, currently `["holds", "activity"]`. A page that must
+work against older engines keys off it: `holds` means the hold services and
+views exist, `activity` means the services take `source` and the log carries
+`requests`. Everything listed is additive; `api_version` stays 1.
 
 Boosts and exceptions go through the ordinary service endpoints, for example
 `POST /api/services/heating_engine/boost`.
@@ -164,12 +172,18 @@ Services:
 
 | Service | Fields |
 |---|---|
-| `heating_engine.boost` | `room`, optional `temp`, optional `minutes` |
-| `heating_engine.cancel_boost` | `room` |
-| `heating_engine.hold` | `room`, `kind` (`skip`, `eco`, `frost`, `temp`), `temp` (for `temp` only), optional `until` (`next_change`, `indefinite`, or an ISO 8601 datetime; defaults to the kind's own end) |
-| `heating_engine.cancel_hold` | `room` |
-| `heating_engine.set_exception` | `person`, `night`, `here` |
-| `heating_engine.clear_exception` | `person`, `night` |
+| `heating_engine.boost` | `room`, optional `temp`, optional `minutes`, optional `source` |
+| `heating_engine.cancel_boost` | `room`, optional `source` |
+| `heating_engine.hold` | `room`, `kind` (`skip`, `eco`, `frost`, `temp`), `temp` (for `temp` only), optional `until` (`next_change`, `indefinite`, or an ISO 8601 datetime; defaults to the kind's own end), optional `source` |
+| `heating_engine.cancel_hold` | `room`, optional `source` |
+| `heating_engine.set_exception` | `person`, `night`, `here`, optional `source` |
+| `heating_engine.clear_exception` | `person`, `night`, optional `source` |
+
+`source` says who is asking: 1 to 32 characters of `a-z` and `_`, for example
+`heating_page`. It goes in the activity log next to the name of the Home
+Assistant user behind the call, when the call carried one, and is copied to
+the boost or hold it creates and to every write that boost or hold causes. A
+call without it is logged with `source: null`.
 
 Entities:
 
@@ -183,18 +197,39 @@ The health sensor cannot report its own death. See
 [docs/dashboard-notices.md](docs/dashboard-notices.md) for the watchdog that
 lives outside the integration.
 
-## Reading the observe-mode log
+## Reading the log
 
-With every room in observe mode the engine writes nothing, but it says what it
-would have written. Three places to read it:
+The engine keeps four lists, each bounded at 200 entries, oldest first, and all
+of them survive a restart. `heating_engine/log` over the websocket and
+`GET /api/heating_engine/log` return them as JSON:
 
-1. **Logbook / logs.** Settings, System, Logs, search `heating_engine`. Lines
-   start `would write:`, `write:` or `Unexpected setpoint change`.
-2. **The websocket.** `heating_engine/log` returns the same three lists as JSON.
-3. **The sensors.** `sensor.heating_<room>_target` carries `would_write: true`
-   while the valve differs from the target.
+| List | One entry per | Fields |
+|---|---|---|
+| `would_write` | distinct target an observing room's valve differed from (once per target, not every minute) | `when`, `room`, `entity_id`, `from`, `from_mode`, `to`, `reason` |
+| `writes` | write sent to a valve | `when`, `room`, `entity_id`, `temp`, `attempt`, `reason`, `cause`, `source` |
+| `unexpected_changes` | setpoint or mode change the engine did not make | `when`, `room`, `entity_id`, `kind`, `old`, `new` |
+| `requests` | request the engine accepted, write or no write | `when`, `room`, `person`, `action`, `detail`, `source`, `user` |
 
-A would-write line is logged once per distinct target, not every minute.
+`cause` on a write is `schedule`, `boost`, `hold`, `manual` (re-asserting a
+change made at the radiator) or `restore` (putting an observing room's setpoint
+back after a boost or hold). `source` is copied from the boost or hold behind
+the write, so a restore after a boost from the phone is filed under the phone
+too; `null` otherwise.
+
+A request's `action` is `boost`, `cancel_boost`, `hold`, `cancel_hold`,
+`set_exception`, `clear_exception` or `config`. `room` or `person` says what it
+was about (both `null` for a config save). `detail` is plain words: "Boost to
+21° for 15 min", "Back to the schedule", "Skip until 19:00", "Hold at Eco until
+turned back on", "Frost protection until turned back on", "Set to 18° until
+19:00", "Away on Wed 25 Nov", "Back to the rota on Wed 25 Nov", "Schedule or
+settings changed". A cancel that found nothing to cancel, and a clear that found
+nothing to clear, are not logged. `source` is the caller's tag and `user` the
+Home Assistant user's name, each `null` when absent.
+
+The same lines reach the Home Assistant log (Settings, System, Logs, search
+`heating_engine`): `would write:`, `write:`, `Unexpected setpoint change`,
+`Request:`. And `sensor.heating_<room>_target` carries `would_write: true`
+while an observing room's valve differs from the target.
 
 ## Config document
 

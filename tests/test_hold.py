@@ -247,7 +247,7 @@ def test_runtime_state_round_trips_through_dict():
     again = state_from_dict(raw)
     assert again == state
     assert state_to_dict(again) == raw
-    assert raw["holds"][0] == {"room": "blue_room", "kind": "skip", "temp": None, "until": "2026-01-06T21:00:00+00:00", "set_at": "2026-01-06T18:00:00+00:00", "restore_temp": 16.0}
+    assert raw["holds"][0] == {"room": "blue_room", "kind": "skip", "temp": None, "until": "2026-01-06T21:00:00+00:00", "set_at": "2026-01-06T18:00:00+00:00", "restore_temp": 16.0, "source": None}
     assert again.holds["kitchen"].until is None
     assert again.holds["attic"].set_at.tzinfo is not None
 
@@ -277,7 +277,7 @@ def test_hold_to_dict_is_the_state_api_shape():
     cfg = make_config()
     h = Hold("blue_room", "skip", until=L(2026, 1, 6, 21), set_at=L(2026, 1, 6, 18), restore_temp=16.0)
     d = h.to_dict(room(cfg, "blue_room"))
-    assert d == {"room": "blue_room", "kind": "skip", "target": 16.0, "until": "2026-01-06T21:00:00+00:00", "set_at": "2026-01-06T18:00:00+00:00"}
+    assert d == {"room": "blue_room", "kind": "skip", "target": 16.0, "until": "2026-01-06T21:00:00+00:00", "set_at": "2026-01-06T18:00:00+00:00", "source": None}
     assert "restore_temp" not in d and "temp" not in d
     h = Hold("blue_room", "temp", until=None, set_at=L(2026, 1, 6, 18), temp=18.0)
     assert h.to_dict(room(cfg, "blue_room"))["target"] == 18.0
