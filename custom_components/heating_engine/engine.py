@@ -497,13 +497,19 @@ class HeatingEngine:
         on the written entity and on every watched device in the room."""
         reason = reason or status.reason_text
         data = {ATTR_ENTITY_ID: room.climate, ATTR_TEMPERATURE: temp, ATTR_HVAC_MODE: HEAT}
+        # Record the expectation BEFORE the call. A blocking climate call returns
+        # only after the device reports back, and that report is a state change
+        # the engine sees while the call is still awaiting. Recording afterwards
+        # (v0.2.1 and earlier) made the engine file its own echo as an unexpected
+        # change and, for a setpoint echo, install a manual override at the value
+        # it had just written. Seen live: a boost that never restored.
+        pw = self.tracker.record_write(room.climate, room.id, temp, now)
+        for other in room.watch:
+            self.tracker.expect(other, temp, now)
         try:
             await self.hass.services.async_call(CLIMATE_DOMAIN, SERVICE_SET_TEMPERATURE, data, blocking=True)
         except HomeAssistantError as exc:
             _LOGGER.warning("Write to %s (%s) raised %s; will read back and retry", room.name, room.climate, exc)
-        pw = self.tracker.record_write(room.climate, room.id, temp, now)
-        for other in room.watch:
-            self.tracker.expect(other, temp, now)
         self.writes_sent += 1
         status.last_write = now
         entry = {"when": now.isoformat(), "room": room.id, "entity_id": room.climate, "temp": temp, "attempt": pw.attempts, "reason": reason}

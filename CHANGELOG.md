@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.2 — 2026-11-24
+
+- **The engine no longer mistakes its own write for someone else's.** `_write` recorded the expectation only after the blocking climate call returned, but a Matter device reports the new setpoint while that call is still awaiting, so the engine saw its own echo first, counted it as an unexpected change and, for a setpoint echo, installed a manual override at the value it had just written. Seen live: a boost whose end never restored the schedule because the boost's own echo had become a "manual hold". The expectation is now recorded before the call. A guard test keeps that order.
+
 ## v0.2.1 — 2026-11-23
 
 - **The last successful calendar read is kept across restarts.** Seen live after a Home Assistant restart: the engine evaluated before the calendar integration had loaded, `calendar.get_events` was "not found", and with no events every calendar person counted as home for five minutes. Now the last known events are stored with the runtime state and used until a read succeeds, the integration loads after `calendar`, and while nothing is known a failed read is retried every minute rather than every five. The problem text says which it is: "using the last known trips" or "nobody is treated as away".

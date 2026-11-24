@@ -58,3 +58,17 @@ def test_no_addresses_or_tokens_anywhere_in_the_repo():
             for m in rx.finditer(text):
                 hits.append(f"{path.relative_to(REPO)}: {m.group(0)}")
     assert not hits, hits
+
+
+ENGINE = REPO / "custom_components" / "heating_engine" / "engine.py"
+
+
+def test_a_write_is_recorded_before_the_climate_call_is_awaited():
+    """The device's report arrives while the blocking call is still awaiting.
+    If the tracker learns about the write only afterwards, the engine files its
+    own echo as an unexpected change. Order inside _write must stay: record, then call."""
+    source = ENGINE.read_text(encoding="utf-8")
+    body = source.split("async def _write(", 1)[1].split("\n    def ", 1)[0]
+    recorded = body.index("self.tracker.record_write(")
+    called = body.index("await self.hass.services.async_call(")
+    assert recorded < called, "record_write must come before the climate service call"
