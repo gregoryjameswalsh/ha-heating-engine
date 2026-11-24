@@ -22,6 +22,8 @@ SIGNAL_CONFIG_CHANGED = f"{DOMAIN}_config_changed"  # rooms/people may have been
 
 SERVICE_BOOST = "boost"
 SERVICE_CANCEL_BOOST = "cancel_boost"
+SERVICE_HOLD = "hold"
+SERVICE_CANCEL_HOLD = "cancel_hold"
 SERVICE_SET_EXCEPTION = "set_exception"
 SERVICE_CLEAR_EXCEPTION = "clear_exception"
 

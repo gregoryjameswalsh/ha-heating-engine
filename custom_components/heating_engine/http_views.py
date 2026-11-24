@@ -9,6 +9,8 @@ write; the household decides who gets a token.
   POST /api/heating_engine/config           {config, base_rev} -> {rev}; 409 rev_conflict, 400 invalid_config
   GET  /api/heating_engine/plan?start=&end= {segments}
   GET  /api/heating_engine/log              would-writes, writes, unexpected changes
+  POST /api/heating_engine/hold             {room, kind, temp?, until?} -> {room: <room state>, hold}
+  POST /api/heating_engine/cancel-hold      {room} -> {room: <room state>, hold: null}
 
 Boosts and exceptions use the ordinary service endpoints:
   POST /api/services/heating_engine/boost  etc.
@@ -25,7 +27,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .const import API_VERSION, DOMAIN, MAX_PLAN_DAYS
-from .engine import HeatingEngine, RevConflict, RoomStatus
+from .engine import HeatingEngine, RevConflict, RoomStatus, UnknownRoom
+from .heating_core import Room
 from .heating_core.validate import ValidationError
 
 
@@ -38,7 +41,7 @@ def _iso(value: Any) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def room_status_dict(status: RoomStatus) -> dict[str, Any]:
+def room_status_dict(status: RoomStatus, room: Room) -> dict[str, Any]:
     return {
         "room": status.room_id,
         "room_name": status.room_name,
@@ -59,7 +62,28 @@ def room_status_dict(status: RoomStatus) -> dict[str, Any]:
         "last_write": _iso(status.last_write),
         "problem": status.problem,
         "boost_until": _iso(status.boost_until),
+        "hvac_action": status.hvac_action,
+        "hold": _hold_dict(status.hold, room),
     }
+
+
+def _hold_dict(hold: Any, room: Room) -> dict[str, Any] | None:
+    """{kind, target, until, set_at} as the state API shows a room's hold."""
+    if hold is None:
+        return None
+    d = hold.to_dict(room)
+    d.pop("room", None)
+    return d
+
+
+def room_entry(engine: HeatingEngine, room: Room) -> dict[str, Any]:
+    """One entry of the `rooms` list in GET state."""
+    status = engine.rooms.get(room.id)
+    d = room_status_dict(status, room) if status else {"room": room.id, "room_name": room.name, "climate_entity": room.climate, "mode": "control" if room.control else "observe"}
+    d["temps"] = room.temps.to_dict()
+    d["occupants"] = list(room.occupants)
+    d["control"] = room.control
+    return d
 
 
 class _View(HomeAssistantView):
@@ -81,14 +105,7 @@ class StateView(_View):
         if isinstance(engine, web.Response):
             return engine
         now = dt_util.utcnow()
-        rooms = []
-        for r in engine.config.rooms:
-            status = engine.rooms.get(r.id)
-            d = room_status_dict(status) if status else {"room": r.id, "room_name": r.name, "climate_entity": r.climate, "mode": "control" if r.control else "observe"}
-            d["temps"] = r.temps.to_dict()
-            d["occupants"] = list(r.occupants)
-            d["control"] = r.control
-            rooms.append(d)
+        rooms = [room_entry(engine, r) for r in engine.config.rooms]
         people = []
         for p in engine.config.people:
             info = engine.people_here.get(p.id)
@@ -115,6 +132,7 @@ class StateView(_View):
                     {"room": b.room, "temp": b.temp, "until": b.until.isoformat(), "start": _iso(b.start)}
                     for b in engine.state.boosts.values()
                 ],
+                "holds": [h.to_dict(r) for h in engine.state.holds.values() if (r := engine.config.room(h.room)) is not None],
                 "exceptions": [e.to_dict() for e in engine.config.exceptions],
             }
         )
@@ -181,6 +199,57 @@ class PlanView(_View):
         return self.json({"segments": [s.to_dict() for s in segments], "api_version": API_VERSION})
 
 
+class HoldView(_View):
+    """POST {room, kind, temp?, until?}: the same code as the `hold` service."""
+
+    url = "/api/heating_engine/hold"
+    name = "api:heating_engine:hold"
+
+    async def post(self, request: web.Request) -> web.Response:
+        engine = self._engine_or_error(request)
+        if isinstance(engine, web.Response):
+            return engine
+        try:
+            body = await request.json()
+            room_id = str(body["room"])
+            kind = str(body["kind"])
+            temp = body.get("temp")
+            until = body.get("until")
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self.json_message("Body must be JSON with room and kind, optionally temp and until", HTTPStatus.BAD_REQUEST, message_code="bad_request")
+        try:
+            hold = await engine.async_hold(room_id, kind, temp, until)
+        except UnknownRoom as exc:
+            return self.json_message(f"Unknown room: {exc}", HTTPStatus.NOT_FOUND, message_code="unknown_room")
+        except ValidationError as exc:
+            return self.json_message("; ".join(exc.errors), HTTPStatus.BAD_REQUEST, message_code="invalid_request")
+        room = engine.config.room(room_id)
+        return self.json({"room": room_entry(engine, room) if room else None, "hold": _hold_dict(hold, room) if room else None, "api_version": API_VERSION})
+
+
+class CancelHoldView(_View):
+    """POST {room}: the same code as the `cancel_hold` service."""
+
+    url = "/api/heating_engine/cancel-hold"
+    name = "api:heating_engine:cancel_hold"
+
+    async def post(self, request: web.Request) -> web.Response:
+        engine = self._engine_or_error(request)
+        if isinstance(engine, web.Response):
+            return engine
+        try:
+            body = await request.json()
+            room_id = str(body["room"])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return self.json_message("Body must be JSON with room", HTTPStatus.BAD_REQUEST, message_code="bad_request")
+        try:
+            await engine.async_cancel_hold(room_id)
+        except UnknownRoom as exc:
+            return self.json_message(f"Unknown room: {exc}", HTTPStatus.NOT_FOUND, message_code="unknown_room")
+        room = engine.config.room(room_id)
+        return self.json({"room": room_entry(engine, room) if room else None, "hold": None, "api_version": API_VERSION})
+
+
 class LogView(_View):
     url = "/api/heating_engine/log"
     name = "api:heating_engine:log"
@@ -196,6 +265,6 @@ def async_register_views(hass: HomeAssistant) -> None:
     data = hass.data.setdefault(DOMAIN, {})
     if data.get("http_registered"):
         return
-    for view in (StateView(), ConfigView(), PlanView(), LogView()):
+    for view in (StateView(), ConfigView(), PlanView(), LogView(), HoldView(), CancelHoldView()):
         hass.http.register_view(view)
     data["http_registered"] = True

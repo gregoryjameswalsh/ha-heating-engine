@@ -104,4 +104,7 @@ class RoomTargetSensor(SensorEntity):
             "last_write": status.last_write.isoformat() if status.last_write else None,
             "problem": status.problem,
             "boost_until": status.boost_until.isoformat() if status.boost_until else None,
+            "hvac_action": status.hvac_action,
+            "hold_kind": status.hold.kind if status.hold else None,
+            "hold_until": status.hold.until.isoformat() if status.hold and status.hold.until else None,
         }

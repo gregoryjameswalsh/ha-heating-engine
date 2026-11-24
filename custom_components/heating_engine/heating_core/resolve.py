@@ -3,13 +3,15 @@
 For each room, the first rule that applies wins:
 
   1  active boost                       -> boost temp
-  2  manual change at the valve / app   -> that temp, until the next schedule change
+  2  a hold set from the dashboard      -> eco, frost or a given temp, until `until` or cancelled
+  3  manual change at the valve / app   -> that temp, until the next schedule change
   4  holiday                            -> empty
   5  occupants away                     -> empty
   7  inside a warm block                -> block temp
   9  otherwise                          -> eco
 
-Rules 3, 6 and 8 are Phase 3 and are not here. `resolve_plan` is a pure
+Rules 6 and 8 (everyone out, room sensed empty) and open-window detection are a
+later phase and are not here. `resolve_plan` is a pure
 function of (config, window, calendar events, runtime state). The same function
 drives the live setpoint and the look-ahead, and it is the only place reason
 text is written, so every surface describes the same moment the same way.
@@ -18,7 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, tzinfo
 
-from .model import Block, CalendarEvent, Config, EngineState, ManualOverride, Room, Segment
+from .model import Block, CalendarEvent, Config, EngineState, Hold, ManualOverride, Room, Segment
 from .occupancy import (
     Interval,
     contains,
@@ -40,13 +42,15 @@ from .timeutil import (
 )
 
 RULE_BOOST = 1
-RULE_MANUAL = 2
+RULE_HOLD = 2
+RULE_MANUAL = 3
 RULE_HOLIDAY = 4
 RULE_AWAY = 5
 RULE_WARM = 7
 RULE_ECO = 9
 
 CODE_BOOST = "boost"
+CODE_HOLD = "hold"
 CODE_MANUAL = "manual"
 CODE_HOLIDAY = "holiday"
 CODE_AWAY = "away"
@@ -61,14 +65,15 @@ LOOKAHEAD = timedelta(days=15)
 class _Piece:
     """A candidate answer at one instant, before merging."""
 
-    __slots__ = ("temp", "rule", "code", "until", "extra")
+    __slots__ = ("temp", "rule", "code", "until", "extra", "hold")
 
-    def __init__(self, temp: float, rule: int, code: str, until: datetime | None, extra: float | None = None):
+    def __init__(self, temp: float, rule: int, code: str, until: datetime | None, extra: float | None = None, hold: Hold | None = None):
         self.temp = temp
         self.rule = rule
         self.code = code
         self.until = until  # UTC, or None when it runs past the look-ahead
         self.extra = extra  # manual: the schedule's own temp at `since`, for up/down wording
+        self.hold = hold  # hold: the hold itself, for its kind in the wording
 
     def same_as(self, other: "_Piece") -> bool:
         return self.rule == other.rule and self.code == other.code and self.temp == other.temp
@@ -136,6 +141,25 @@ def _base_segments(room: Room, lo: datetime, hi: datetime, tz: tzinfo, occ: list
     return out
 
 
+def _schedule_stretch_at(
+    config: Config,
+    room: Room,
+    at: datetime,
+    calendar_events: dict[str, list[CalendarEvent]],
+    tz: tzinfo,
+) -> tuple[datetime, float]:
+    """The end (UTC) and temp of the schedule stretch (rules 4/5/7/9) in force at
+    `at`. The end is `at` + LOOKAHEAD when nothing changes inside the look-ahead."""
+    at = to_utc(at)
+    hi = at + LOOKAHEAD
+    occ = room_occupied_intervals(config, room, at, hi, tz, calendar_events)
+    hol = holiday_intervals(config, tz)
+    for s, e, temp, _rule, _code in _base_segments(room, at, hi, tz, occ, hol):
+        if s <= at < e:
+            return e, temp
+    return hi, room.temps.eco  # unreachable in practice: the first segment starts at `at`
+
+
 def override_end(
     config: Config,
     room: Room,
@@ -143,17 +167,28 @@ def override_end(
     calendar_events: dict[str, list[CalendarEvent]],
     tz: tzinfo,
 ) -> tuple[datetime, float]:
-    """When a manual override (rule 2) stops: the end of the schedule stretch
+    """When a manual override (rule 3) stops: the end of the schedule stretch
     that was in force at `since`. Also returns that stretch's own temp so the
     reason text can say turned up or down. UTC."""
-    since = to_utc(override.since)
-    hi = since + LOOKAHEAD
-    occ = room_occupied_intervals(config, room, since, hi, tz, calendar_events)
-    hol = holiday_intervals(config, tz)
-    for s, e, temp, _rule, _code in _base_segments(room, since, hi, tz, occ, hol):
-        if s <= since < e:
-            return e, temp
-    return hi, room.temps.eco  # unreachable in practice: the first segment starts at `since`
+    return _schedule_stretch_at(config, room, override.since, calendar_events, tz)
+
+
+def next_schedule_change(
+    config: Config,
+    room: Room,
+    at: datetime,
+    calendar_events: dict[str, list[CalendarEvent]],
+    tz: tzinfo,
+) -> datetime | None:
+    """The next moment after `at` at which the schedule itself would change the
+    room's target: a warm block starting or ending, someone arriving or leaving
+    by the rota or calendar, or a holiday edge. A hold "until the next scheduled
+    change" runs to this moment, and so does a change made at the radiator. UTC.
+    None when nothing changes inside the look-ahead."""
+    end, _temp = _schedule_stretch_at(config, room, at, calendar_events, tz)
+    if end >= to_utc(at) + LOOKAHEAD:
+        return None
+    return end
 
 
 def _reason_text(config: Config, room: Room, piece: _Piece, seg_start: datetime, tz: tzinfo) -> str:
@@ -161,6 +196,16 @@ def _reason_text(config: Config, room: Room, piece: _Piece, seg_start: datetime,
     if piece.code == CODE_BOOST:
         # a boost always has a known end
         return f"Boosted to {format_temp(piece.temp)} until {format_time_until(seg_start, until, tz)}" if until else f"Boosted to {format_temp(piece.temp)}"
+    if piece.code == CODE_HOLD:
+        kind = piece.hold.kind if piece.hold is not None else "temp"
+        when = format_time_until(seg_start, until, tz) if until else "you turn it back on"
+        if kind == "skip":
+            return f"Skipping until {when}"
+        if kind == "eco":
+            return f"Holding at Eco until {when}"
+        if kind == "frost":
+            return f"Frost protection until {when}"
+        return f"Set to {format_temp(piece.temp)} until {when}"
     if piece.code == CODE_MANUAL:
         base = piece.extra
         if base is None or piece.temp == base:
@@ -199,18 +244,29 @@ def _resolve_room(
     hol = holiday_intervals(config, tz)
 
     boost = state.boosts.get(room.id)
+    hold = state.holds.get(room.id)
     override = state.overrides.get(room.id)
 
     lo = ws
     if override is not None:
         lo = min(lo, to_utc(override.since))
+    if hold is not None:
+        lo = min(lo, to_utc(hold.set_at))
     if boost is not None and boost.start is not None:
         lo = min(lo, to_utc(boost.start))
 
     occ = room_occupied_intervals(config, room, lo, far, tz, calendar_events)
     base = _base_segments(room, lo, far, tz, occ, hol)
 
-    # rule 2 window: from `since` to the end of the schedule stretch in force then
+    # rule 2 window: from `set_at` to `until`, or on past the look-ahead when open-ended
+    ho_iv: tuple[datetime, datetime] | None = None
+    if hold is not None:
+        hs = to_utc(hold.set_at)
+        he = far if hold.until is None else min(to_utc(hold.until), far)
+        if he > hs:
+            ho_iv = (hs, he)
+
+    # rule 3 window: from `since` to the end of the schedule stretch in force then
     ov_iv: tuple[datetime, datetime] | None = None
     ov_base_temp: float | None = None
     if override is not None:
@@ -234,7 +290,7 @@ def _resolve_room(
         for x in (s, e):
             if ws < x < far:
                 pts.add(x)
-    for iv in (ov_iv, bo_iv):
+    for iv in (ov_iv, ho_iv, bo_iv):
         if iv is not None:
             for x in iv:
                 if ws < x < far:
@@ -244,6 +300,8 @@ def _resolve_room(
     def piece_at(t: datetime) -> _Piece:
         if bo_iv is not None and bo_iv[0] <= t < bo_iv[1]:
             return _Piece(boost.temp, RULE_BOOST, CODE_BOOST, bo_iv[1])  # type: ignore[union-attr]
+        if ho_iv is not None and ho_iv[0] <= t < ho_iv[1]:
+            return _Piece(hold.target(room), RULE_HOLD, CODE_HOLD, ho_iv[1], hold=hold)  # type: ignore[union-attr]
         if ov_iv is not None and ov_iv[0] <= t < ov_iv[1]:
             return _Piece(override.temp, RULE_MANUAL, CODE_MANUAL, ov_iv[1], ov_base_temp)  # type: ignore[union-attr]
         for s, e, temp, rule, code in base:
@@ -269,7 +327,10 @@ def _resolve_room(
         true_end: datetime | None = None if e >= far else e
         if p.code in (CODE_BOOST, CODE_MANUAL):
             true_end = p.until  # these two always know their own end
-        text = _reason_text(config, room, _Piece(p.temp, p.rule, p.code, true_end, p.extra), s, tz)
+        elif p.code == CODE_HOLD:
+            # a hold knows its own end too, even one past the look-ahead; None = until cancelled
+            true_end = to_utc(p.hold.until) if p.hold is not None and p.hold.until is not None else None
+        text = _reason_text(config, room, _Piece(p.temp, p.rule, p.code, true_end, p.extra, p.hold), s, tz)
         out.append(
             Segment(
                 room=room.id,

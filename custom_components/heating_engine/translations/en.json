@@ -27,6 +27,23 @@
         "room": { "name": "Room", "description": "The room id from the config document." }
       }
     },
+    "hold": {
+      "name": "Hold",
+      "description": "Hold a room at Eco, at frost protection or at a temperature, until the next scheduled change, until cancelled, or until a time.",
+      "fields": {
+        "room": { "name": "Room", "description": "The room id from the config document." },
+        "kind": { "name": "Kind", "description": "skip (Eco until the next scheduled change), eco (Eco until cancelled), frost (frost protection until cancelled) or temp (a temperature until the next scheduled change)." },
+        "temp": { "name": "Temperature", "description": "Target in degrees, half-degree steps. Only for kind temp." },
+        "until": { "name": "Until", "description": "next_change, indefinite, or an ISO 8601 datetime. Defaults to the kind's own end." }
+      }
+    },
+    "cancel_hold": {
+      "name": "Cancel hold",
+      "description": "End a room's hold now.",
+      "fields": {
+        "room": { "name": "Room", "description": "The room id from the config document." }
+      }
+    },
     "set_exception": {
       "name": "Set exception",
       "description": "Mark whether a person sleeps here on one night, overriding the rota.",

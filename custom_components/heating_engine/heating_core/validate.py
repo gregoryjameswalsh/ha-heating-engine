@@ -25,7 +25,8 @@ def _is_step(value: float, step: float) -> bool:
     return abs(q - round(q)) < 1e-9
 
 
-def _check_temp(errors: list[str], where: str, value: float) -> None:
+def check_temp(errors: list[str], where: str, value: float) -> None:
+    """Append a message unless `value` is a half degree inside the allowed range."""
     if not (TEMP_MIN <= value <= TEMP_MAX):
         errors.append(f"{where}: {value:g} is outside {TEMP_MIN:g} to {TEMP_MAX:g}")
     elif not _is_step(value, TEMP_STEP):
@@ -115,9 +116,10 @@ def validate_config(config: Config) -> list[str]:
                 errors.append(f"{where}: occupant {pid!r} is not a known person")
         if len(set(r.occupants)) != len(r.occupants):
             errors.append(f"{where}: an occupant is listed twice")
-        _check_temp(errors, f"{where}: comfort", r.temps.comfort)
-        _check_temp(errors, f"{where}: eco", r.temps.eco)
-        _check_temp(errors, f"{where}: empty", r.temps.empty)
+        check_temp(errors, f"{where}: comfort", r.temps.comfort)
+        check_temp(errors, f"{where}: eco", r.temps.eco)
+        check_temp(errors, f"{where}: empty", r.temps.empty)
+        check_temp(errors, f"{where}: frost", r.temps.frost)
         for day in DAYS:
             blocks = r.blocks_for(day)
             prev_end: int | None = None
@@ -125,7 +127,7 @@ def validate_config(config: Config) -> list[str]:
                 label = f"{where}: {day} block {i + 1}"
                 ok = _check_time(errors, f"{label} start", b.start, allow_24=False)
                 ok = _check_time(errors, f"{label} end", b.end, allow_24=True) and ok
-                _check_temp(errors, f"{label} temp", b.temp)
+                check_temp(errors, f"{label} temp", b.temp)
                 if not ok:
                     continue
                 s, e = minutes_of(b.start), minutes_of(b.end)
