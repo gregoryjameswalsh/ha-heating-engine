@@ -90,6 +90,15 @@ Consecutive nights merge into one stay. People can follow a 14-night pattern, be
 always present, or follow a calendar where an event means they are away, with a
 pre-heat before they return.
 
+The engine reads a calendar entity the way Home Assistant's own
+`GET /api/calendars/<entity>` does: it asks the entity directly rather than
+calling `calendar.get_events`. The service route silently drops an entity whose
+state is `unavailable` and then fails with "did not match any entities", while
+the entity itself can usually still answer from what it last fetched. If a
+calendar entity is unavailable the engine logs that once and carries on reading
+it; if the id in the config is mis-cased or is not a calendar entity at all, the
+health problem says so in words.
+
 All times are local wall-clock times in Home Assistant's zone. Both clock-change
 days are covered by tests.
 
@@ -137,6 +146,15 @@ Each room in `state` carries `hvac_action` (the climate entity's own
 one) and `hold`: `null`, or `{kind, target, until, set_at}` with `until` an ISO
 datetime or `null` for a hold that runs until cancelled. A top-level `holds`
 list carries the same objects with a `room` field, as `boosts` does.
+
+`hvac_action` is `null` for Tado X valves and thermostats paired over Matter.
+Home Assistant's Matter integration only fills `hvac_action` from the
+thermostat's optional `ThermostatRunningState` attribute, and Tado X devices do
+not expose it (nor do Eve Thermo or Nest over Matter). So for those rooms the
+engine cannot say whether the valve is calling for heat right now, and a
+dashboard should treat a `null` as "not reported", not as "idle". Climate
+entities from integrations that do report it (Tado's cloud integration, most
+Zigbee and Z-Wave thermostats) come through as `heating`, `idle` or `off`.
 
 A boost writes to the valve even while the room is only observing: it is an
 explicit, time-bounded request. For an observing room the engine puts back the

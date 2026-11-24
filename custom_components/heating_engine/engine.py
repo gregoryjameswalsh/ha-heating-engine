@@ -64,6 +64,7 @@ from .heating_core import (
     resolve_now,
     resolve_plan,
 )
+from .calendar_read import read_calendar
 from .heating_core.apply import (
     FAILED,
     HEAT,
@@ -175,6 +176,7 @@ class HeatingEngine:
         self.calendar_ok: bool | None = None  # None = nothing fetched yet
         self.calendar_error: str | None = None
         self._calendar_fetched_at: datetime | None = None
+        self._calendars_unavailable: set[str] = set()  # warned about once, until they come back
         self.last_evaluated: datetime | None = None
         self.started_at: datetime | None = None
         self.last_error: str | None = None
@@ -691,53 +693,42 @@ class HeatingEngine:
             wait = timedelta(minutes=1) if (self.calendar_ok is False and not self.calendar_events) else CALENDAR_REFRESH
             if now - self._calendar_fetched_at < wait:
                 return
-        start = (now - CALENDAR_LOOKBACK).isoformat()
-        end = (now + CALENDAR_LOOKAHEAD).isoformat()
+        # Read each calendar entity directly, the way HA's own GET /api/calendars/<entity>
+        # does. The calendar.get_events service goes through the entity service layer,
+        # which drops an entity whose state is `unavailable` and then fails with
+        # "did not match any entities", while the entity itself can still answer from
+        # what it last fetched. See calendar_read.py.
+        start = now - CALENDAR_LOOKBACK
+        end = now + CALENDAR_LOOKAHEAD
         fetched: dict[str, list[CalendarEvent]] = {}
+        unavailable: set[str] = set()
         try:
             for cal in calendars:
-                resp = await self.hass.services.async_call(
-                    "calendar",
-                    "get_events",
-                    {ATTR_ENTITY_ID: cal, "start_date_time": start, "end_date_time": end},
-                    blocking=True,
-                    return_response=True,
-                )
-                raw_events = (resp or {}).get(cal, {}).get("events", [])
-                fetched[cal] = [ev for ev in (self._parse_event(e) for e in raw_events) if ev is not None]
+                read = await read_calendar(self.hass, cal, start, end, self._tz)
+                fetched[cal] = [CalendarEvent(start=s, end=e) for s, e in read.spans]
+                if not read.available:
+                    unavailable.add(cal)
         except Exception as exc:  # noqa: BLE001
             self.calendar_ok = False
             self.calendar_error = f"{type(exc).__name__}: {exc}"
             _LOGGER.warning("Calendar read failed, keeping the last known events: %s", self.calendar_error)
             self._calendar_fetched_at = now  # do not hammer a broken calendar every minute
             return
+        newly_unavailable = unavailable - self._calendars_unavailable
+        if newly_unavailable:
+            _LOGGER.warning(
+                "%s is unavailable in Home Assistant; reading what it last fetched. Check its integration.",
+                ", ".join(sorted(newly_unavailable)),
+            )
+        for cal in self._calendars_unavailable - unavailable:
+            _LOGGER.info("%s is available again", cal)
+        self._calendars_unavailable = unavailable
         if fetched != self.calendar_events:
             self._state_dirty = True  # persist the last known events for the next restart
         self.calendar_events = fetched
         self.calendar_ok = True
         self.calendar_error = None
         self._calendar_fetched_at = now
-
-    def _parse_event(self, raw: dict[str, Any]) -> CalendarEvent | None:
-        try:
-            s = self._parse_when(raw["start"])
-            e = self._parse_when(raw["end"])
-        except (KeyError, ValueError, TypeError):
-            return None
-        if s is None or e is None:
-            return None
-        return CalendarEvent(start=s, end=e)
-
-    def _parse_when(self, value: Any) -> datetime | None:
-        text = str(value)
-        if len(text) == 10:  # all-day: YYYY-MM-DD, local midnight
-            return datetime.combine(date.fromisoformat(text), datetime.min.time(), tzinfo=self._tz)
-        dt = dt_util.parse_datetime(text)
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=self._tz)
-        return dt
 
     # ------------------------------------------------------------------ health
 
