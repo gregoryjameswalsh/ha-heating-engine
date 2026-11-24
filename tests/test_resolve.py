@@ -1,12 +1,17 @@
 from datetime import date, timedelta
 
+import pytest
+
 from heating_core import (
+    PLAN_GRACE,
     Boost,
     CalendarEvent,
     EngineState,
     ExceptionNight,
+    Hold,
     Holiday,
     ManualOverride,
+    matches_plan,
     override_end,
     resolve_now,
     resolve_plan,
@@ -239,6 +244,87 @@ def test_manual_change_equal_to_schedule_says_changed():
     state = EngineState(overrides={"blue_room": ManualOverride("blue_room", 19.0, since=L(2026, 1, 6, 18))})
     segs = segs_for(resolve_plan(cfg, L(2026, 1, 6, 18), L(2026, 1, 6, 19), state=state), "blue_room")
     assert segs[0].reason_text == "Changed at the radiator. Back to schedule at 21:00"
+
+
+# ---- a setpoint that lands on the schedule is the schedule's, not a manual change ----
+# Blue Room, Tue 6 Jan: warm 19 from 17:00 to 21:00, eco 16 after, warm again 06:30.
+
+
+def test_matches_plan_now_and_within_the_grace_but_not_before():
+    cfg = make_config()
+    blue = room(cfg, "blue_room")
+    assert matches_plan(cfg, blue, 19.0, "heat", L(2026, 1, 6, 19)) is True
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 6, 19)) is False
+    # the device's own schedule steps five seconds before the engine's block edge
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 6, 20, 59) + timedelta(seconds=55)) is True
+    # or two seconds after it
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 6, 21) + timedelta(seconds=2)) is True
+    # two minutes early is somebody's hand
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 6, 20, 58)) is False
+    assert PLAN_GRACE == timedelta(seconds=90)
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 6, 20, 58), grace=timedelta(minutes=5)) is True
+
+
+def test_matches_plan_needs_heat_mode_and_a_setpoint():
+    cfg = make_config()
+    blue = room(cfg, "blue_room")
+    assert matches_plan(cfg, blue, 19.0, "off", L(2026, 1, 6, 19)) is False
+    assert matches_plan(cfg, blue, 19.0, "auto", L(2026, 1, 6, 19)) is False
+    assert matches_plan(cfg, blue, 19.0, None, L(2026, 1, 6, 19)) is False
+    assert matches_plan(cfg, blue, None, "heat", L(2026, 1, 6, 19)) is False
+
+
+def test_matches_plan_uses_the_apply_tolerance():
+    cfg = make_config()
+    blue = room(cfg, "blue_room")
+    assert matches_plan(cfg, blue, 19.04, "heat", L(2026, 1, 6, 19)) is True
+    assert matches_plan(cfg, blue, 19.5, "heat", L(2026, 1, 6, 19)) is False
+
+
+def test_matches_plan_sees_through_the_rooms_own_override_only_when_asked():
+    cfg = make_config()
+    blue = room(cfg, "blue_room")
+    state = EngineState(overrides={"blue_room": ManualOverride("blue_room", 17.5, since=L(2026, 1, 6, 18, 30))})
+    at = L(2026, 1, 6, 19)
+    # the radiator is put back to the schedule's 19: that is the schedule, and the override should end
+    assert matches_plan(cfg, blue, 19.0, "heat", at, state=state, ignore_override=True) is True
+    # as the plan stands, the room is at 17.5 under the override
+    assert matches_plan(cfg, blue, 19.0, "heat", at, state=state) is False
+    assert matches_plan(cfg, blue, 17.5, "heat", at, state=state) is True
+    # another room's override is not in the way either way
+    other = EngineState(overrides={"kitchen": ManualOverride("kitchen", 17.5, since=L(2026, 1, 6, 18, 30))})
+    assert matches_plan(cfg, blue, 19.0, "heat", at, state=other) is True
+    assert matches_plan(cfg, blue, 19.0, "heat", at, state=other, ignore_override=True) is True
+    assert state.overrides == {"blue_room": ManualOverride("blue_room", 17.5, since=L(2026, 1, 6, 18, 30))}  # not mutated
+
+
+def test_matches_plan_counts_a_hold_and_a_boost_as_the_plan():
+    cfg = make_config()
+    blue = room(cfg, "blue_room")
+    held = EngineState(holds={"blue_room": Hold("blue_room", "eco", None, L(2026, 1, 6, 18))})
+    # a hand setting the held room to Eco is the hold's own value, not a manual change
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 6, 19), state=held, ignore_override=True) is True
+    assert matches_plan(cfg, blue, 19.0, "heat", L(2026, 1, 6, 19), state=held, ignore_override=True) is False
+    boosted = EngineState(boosts={"blue_room": Boost("blue_room", 21.0, until=L(2026, 1, 6, 19, 30), start=L(2026, 1, 6, 18, 30))})
+    assert matches_plan(cfg, blue, 21.0, "heat", L(2026, 1, 6, 19), state=boosted) is True
+    # ten seconds before the boost ends, the schedule's 19 is already the plan
+    assert matches_plan(cfg, blue, 19.0, "heat", L(2026, 1, 6, 19, 29) + timedelta(seconds=50), state=boosted) is True
+    assert matches_plan(cfg, blue, 19.0, "heat", L(2026, 1, 6, 19), state=boosted) is False
+
+
+def test_matches_plan_at_a_rota_edge():
+    cfg = make_config()
+    blue = room(cfg, "blue_room")
+    # Mon 5 Jan: empty (14) until the 15:00 arrival, then eco 16
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 5, 14, 59) + timedelta(seconds=30)) is True
+    assert matches_plan(cfg, blue, 16.0, "heat", L(2026, 1, 5, 14, 30)) is False
+    assert matches_plan(cfg, blue, 14.0, "heat", L(2026, 1, 5, 14, 30)) is True
+
+
+def test_matches_plan_wants_an_aware_time():
+    cfg = make_config()
+    with pytest.raises(ValueError):
+        matches_plan(cfg, room(cfg, "blue_room"), 19.0, "heat", L(2026, 1, 6, 19).replace(tzinfo=None))
 
 
 # ---- calendar-driven rooms ----

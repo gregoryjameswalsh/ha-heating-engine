@@ -18,8 +18,10 @@ text is written, so every surface describes the same moment the same way.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, tzinfo
 
+from .apply import HEAT, same_temp
 from .model import Block, CalendarEvent, Config, EngineState, Hold, ManualOverride, Room, Segment
 from .occupancy import (
     Interval,
@@ -60,6 +62,11 @@ CODE_ECO = "eco"
 # How far past the requested window the resolver looks so that an 'until' can be
 # found for a stretch that runs off the end of the window.
 LOOKAHEAD = timedelta(days=15)
+
+# How far ahead `matches_plan` looks. A device's own schedule (Tado's, say) and
+# the engine's block edges move in the same minute, in no guaranteed order, so a
+# setpoint that is what the plan asks for a few seconds from now is the plan's.
+PLAN_GRACE = timedelta(seconds=90)
 
 
 class _Piece:
@@ -383,3 +390,37 @@ def resolve_now(
         if s.room not in out:
             out[s.room] = s
     return out
+
+
+def matches_plan(
+    config: Config,
+    room: Room,
+    setpoint: float | None,
+    mode: str | None,
+    at: datetime,
+    calendar_events: dict[str, list[CalendarEvent]] | None = None,
+    state: EngineState | None = None,
+    *,
+    ignore_override: bool = False,
+    grace: timedelta = PLAN_GRACE,
+) -> bool:
+    """Is `setpoint`/`mode` what the rules set for `room` at `at`, or what they
+    will set within `grace` of it?
+
+    The mode must be `heat`. With `ignore_override` the room's own manual
+    change (rule 3) is left out, so the question becomes "does this setpoint
+    match the schedule the override sits on top of": a change at the radiator
+    that lands on that value is not a manual change, and ends one that is on.
+    Boosts and holds always count: a setpoint equal to a hold's target is the
+    hold's, not a hand on the radiator. `at` must be aware; its zone is the
+    engine's."""
+    if setpoint is None or mode != HEAT:
+        return False
+    if at.tzinfo is None:
+        raise ValueError("at must be an aware datetime")
+    st = state or EngineState()
+    if ignore_override and room.id in st.overrides:
+        st = replace(st, overrides={k: v for k, v in st.overrides.items() if k != room.id})
+    ws = to_utc(at)
+    segs = _resolve_room(config, room, ws, ws + grace, at.tzinfo, calendar_events or {}, st)
+    return any(same_temp(s.temp, setpoint) for s in segs)

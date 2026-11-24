@@ -67,6 +67,7 @@ from .heating_core import (
     clear_exception_detail,
     exception_detail,
     hold_detail,
+    matches_plan,
     next_schedule_change,
     override_end,
     person_here_tonight,
@@ -629,6 +630,11 @@ class HeatingEngine:
                     in_flight = status.pending_write and abs(self.tracker.pending[room.climate].temp - seg.temp) <= self.tracker.tolerance
                     if in_flight:
                         pass  # written already, waiting for the valve to report it
+                    elif matches_plan(self.config, room, setpoint, mode, now_local, self.calendar_events, self.state):
+                        # the valve already shows what the plan asks for a few seconds from
+                        # now (its own schedule moved just before ours): writing the old
+                        # target would be undone at the edge, so wait for the edge
+                        _LOGGER.debug("%s already at the upcoming target %s/heat; not writing %s", room.name, setpoint, seg.temp)
                     elif room.control or boost is not None or hold is not None:
                         # control mode, or an explicit boost or hold: the writes an observing room gets
                         cause, source = self._cause_and_source(room, seg.reason_code)
@@ -780,9 +786,23 @@ class HeatingEngine:
         _new_avail, new_sp, new_mode = _setpoint_and_mode(new)
         now = dt_util.utcnow()
         verdict = self.tracker.classify_change(entity_id, now, old_sp, new_sp, old_mode, new_mode)
-        if verdict in (MANUAL_SETPOINT, MODE_CHANGE):
-            old_txt = f"{old_sp}/{old_mode}"
-            new_txt = f"{new_sp}/{new_mode}"
+        old_txt = f"{old_sp}/{old_mode}"
+        new_txt = f"{new_sp}/{new_mode}"
+        if verdict == MANUAL_SETPOINT and new_sp is not None and matches_plan(
+            self.config, room, new_sp, new_mode, now.astimezone(self._tz), self.calendar_events, self.state, ignore_override=True
+        ):
+            # The new setpoint is what the schedule (or a boost or hold) asks for now
+            # or within the grace window: the device's own schedule moving at a block
+            # edge, or a hand putting the radiator back where the schedule has it.
+            # Not a manual change, not unexpected. Seen live: Tado's own schedule
+            # stepping to the engine's target two seconds after the block edge, and
+            # the room showing as manually overridden for the whole block.
+            if self.state.overrides.pop(room.id, None) is not None:
+                self._state_dirty = True
+                _LOGGER.info("Change in %s matches the schedule: %s %s -> %s; the manual change ended early", room.name, entity_id, old_txt, new_txt)
+            else:
+                _LOGGER.info("Change in %s matches the schedule: %s %s -> %s; not a manual change", room.name, entity_id, old_txt, new_txt)
+        elif verdict in (MANUAL_SETPOINT, MODE_CHANGE):
             self.changes.add(ChangeLogEntry(when=now, room=room.id, entity_id=entity_id, kind=verdict, old=old_txt, new=new_txt))
             self._state_dirty = True
             if verdict == MANUAL_SETPOINT and new_sp is not None:
