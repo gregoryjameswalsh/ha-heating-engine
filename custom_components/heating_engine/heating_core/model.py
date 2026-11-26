@@ -191,6 +191,9 @@ class Config:
     rooms: list[Room] = field(default_factory=list)
     exceptions: list[ExceptionNight] = field(default_factory=list)
     holidays: list[Holiday] = field(default_factory=list)
+    # an entity with the outside temperature (a numeric sensor, or a weather
+    # entity's `temperature` attribute); only the learning record reads it
+    outside_sensor: str | None = None
 
     def person(self, person_id: str) -> Person | None:
         for p in self.people:
@@ -213,10 +216,12 @@ class Config:
             "rooms": [r.to_dict() for r in self.rooms],
             "exceptions": [e.to_dict() for e in self.exceptions],
             "holidays": [h.to_dict() for h in self.holidays],
+            "outside_sensor": self.outside_sensor,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Config:
+        outside = d.get("outside_sensor")
         return cls(
             version=int(d.get("version", 1)),
             rev=int(d.get("rev", 0)),
@@ -225,6 +230,7 @@ class Config:
             rooms=[Room.from_dict(r) for r in d.get("rooms", [])],
             exceptions=[ExceptionNight.from_dict(e) for e in d.get("exceptions", [])],
             holidays=[Holiday.from_dict(h) for h in d.get("holidays", [])],
+            outside_sensor=str(outside) if outside else None,
         )
 
 

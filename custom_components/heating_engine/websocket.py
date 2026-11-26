@@ -12,7 +12,7 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
 
-from .const import API_VERSION, DOMAIN, MAX_PLAN_DAYS, WS_GET_CONFIG, WS_LOG, WS_PLAN, WS_SET_CONFIG
+from .const import API_VERSION, DOMAIN, MAX_PLAN_DAYS, WS_GET_CONFIG, WS_LEARNING, WS_LOG, WS_PLAN, WS_SET_CONFIG
 from .engine import HeatingEngine, RevConflict
 from .heating_core.validate import ValidationError
 
@@ -104,11 +104,22 @@ def ws_log(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg:
     connection.send_result(msg["id"], engine.recent_log())
 
 
+@websocket_api.websocket_command({vol.Required("type"): WS_LEARNING})
+@callback
+def ws_learning(hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]) -> None:
+    """The learning record: per room, the summary and every kept episode."""
+    engine = _engine(hass)
+    if engine is None:
+        connection.send_error(msg["id"], "not_loaded", "The heating engine is not loaded")
+        return
+    connection.send_result(msg["id"], engine.learning_record())
+
+
 @callback
 def async_register(hass: HomeAssistant) -> None:
     data = hass.data.setdefault(DOMAIN, {})
     if data.get("ws_registered"):
         return
-    for cmd in (ws_get_config, ws_set_config, ws_plan, ws_log):
+    for cmd in (ws_get_config, ws_set_config, ws_plan, ws_log, ws_learning):
         websocket_api.async_register_command(hass, cmd)
     data["ws_registered"] = True

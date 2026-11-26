@@ -14,6 +14,10 @@ else follows the room's own weekly schedule.
 Phase 1: the engine. Pure logic with tests, plus a thin Home Assistant shell.
 No dashboard, no window detection, no presence sensing yet.
 
+Since v0.5.0 it also keeps a **learning record**: how fast each room warms up
+and cools down, measured from the readings. The record acts on nothing; it is
+the groundwork for warm-by times later. See [The learning record](#the-learning-record).
+
 ## What is in this repo, and what is not
 
 Nothing about any real household is in this repository. No names, rooms,
@@ -139,6 +143,7 @@ Websocket commands (send them over the normal Home Assistant websocket):
 | `heating_engine/set_config` | `{config, base_rev, source?}` | `{rev}`, or error `rev_conflict` / `invalid_config` with a plain message |
 | `heating_engine/plan` | `{start, end}` ISO datetimes, at most 15 days | `{segments: [...]}` |
 | `heating_engine/log` | none | the would-write log, writes sent, every change the engine did not make, and every request accepted |
+| `heating_engine/learning` | none | the learning record: per room, the summary and every kept warm-up and cool-down |
 
 REST, for clients that cannot open a websocket (same contract, Home Assistant
 bearer-token auth):
@@ -149,14 +154,17 @@ bearer-token auth):
 | `GET` / `POST /api/heating_engine/config` | as the websocket `get_config` / `set_config` (`POST` body `{config, base_rev, source?}`) |
 | `GET /api/heating_engine/plan?start=&end=` | `{segments}` |
 | `GET /api/heating_engine/log` | as the websocket `log` |
+| `GET /api/heating_engine/learning` | as the websocket `learning` |
 | `POST /api/heating_engine/hold` `{room, kind, temp?, until?, source?}` | `{room: <that room's state entry>, hold}`; 400 `invalid_request`, 404 `unknown_room` |
 | `POST /api/heating_engine/cancel-hold` `{room, source?}` | `{room: <that room's state entry>, hold: null}` |
 
 `features` in `state` is a list of what this engine can do beyond the first
-shape of `api_version` 1, currently `["holds", "activity"]`. A page that must
-work against older engines keys off it: `holds` means the hold services and
-views exist, `activity` means the services take `source` and the log carries
-`requests`. Everything listed is additive; `api_version` stays 1.
+shape of `api_version` 1, currently `["holds", "activity", "learning"]`. A page
+that must work against older engines keys off it: `holds` means the hold
+services and views exist, `activity` means the services take `source` and the
+log carries `requests`, `learning` means each room in `state` carries a
+`learning` block, the `learning` command and view exist, and the config takes
+`outside_sensor`. Everything listed is additive; `api_version` stays 1.
 
 Boosts and exceptions go through the ordinary service endpoints, for example
 `POST /api/services/heating_engine/boost`.
@@ -244,6 +252,72 @@ The same lines reach the Home Assistant log (Settings, System, Logs, search
 not counted as manual. And `sensor.heating_<room>_target` carries `would_write: true`
 while an observing room's valve differs from the target.
 
+## The learning record
+
+The engine watches every room's temperature against its setpoint and keeps a
+record of each **warm-up** and **cool-down**. It acts on nothing: no target,
+block or write depends on it. It is the measured groundwork for warm-by times
+("warm by 07:00", starting early by however long the room needs) in a later
+release, and it makes visible how far a radiator valve's own reading is from
+the room's.
+
+- A **warm-up** starts when the setpoint rises, or heating comes on, to at
+  least 1° above the reading. It ends when the reading is within 0.3° of the
+  setpoint, when the setpoint or mode changes, or after four hours. Its
+  **lag** is the time until the reading has risen 0.3°; its **rate**
+  (degrees per hour) is a least-squares slope from there to where it reached
+  the setpoint, over at most 90 minutes.
+- A **cool-down** starts when the setpoint drops to at least 1.5° below the
+  reading, or heating goes off. The first 45 minutes are skipped (a valve's
+  sensor sits beside the radiator, which is cooling fast); the rate is the
+  slope from 45 minutes to 2 h 45 min, stopping where the reading comes within
+  0.3° of the new setpoint. With an `outside_sensor` in the config it also
+  carries `k`, the rate over (inside minus outside).
+- Each room is followed through every **source** of readings it has:
+  `device`, the climate entity's own `current_temperature` (for a valve, the
+  air beside the radiator), and `sensor`, the room's `temp_sensor` when one is
+  set. Both are recorded side by side.
+- An episode that is open when Home Assistant restarts, or whose readings go
+  missing for more than ten minutes, is dropped, never guessed. One with no
+  measurable rate is not kept. The newest 60 warm-ups and 60 cool-downs are
+  kept per room and source, in the runtime state document (never in the
+  config, never part of `rev`).
+- A summary counts only episodes with at least ten samples, read from the
+  source's current entity, so changing a room's `temp_sensor` starts a fresh
+  count. Until a room has ten, its text says so: "Not enough warm-ups yet (4 of
+  10)."
+
+Each room in `GET state` carries `learning`:
+
+```json
+"learning": {
+  "sources": {
+    "device": {
+      "entity": "climate.blue_room_valve",
+      "label": "The heating device's own reading",
+      "heat": { "count": 12, "needed": 10, "enough": true,
+                "rate": { "median": 0.63, "q1": 0.55, "q3": 0.7 },
+                "lag_min": 37.5, "reach_share": 0.25,
+                "first": "2026-11-14T06:30:00+00:00", "last": "2026-11-24T17:02:00+00:00",
+                "text": "Warms about 1° every 95 minutes, from 12 warm-ups (14 Nov to 24 Nov)." },
+      "cool": { "count": 4, "needed": 10, "enough": false, "rate": { "median": -0.2, "q1": -0.3, "q3": -0.15 },
+                "k": 0.015, "first": "...", "last": "...",
+                "text": "Not enough cool-downs yet (4 of 10)." }
+    }
+  },
+  "open": { "device": "heat" }
+}
+```
+
+`open` names the sources with an episode in progress. `heating_engine/learning`
+and `GET /api/heating_engine/learning` return `{outside_sensor, outside, rooms}`
+with, per room, `name`, the same `summary` and every kept episode under
+`episodes.<source>`, oldest first: `kind`, `entity`, `started`, `ended`,
+`from`, `target`, `outside`, `rooms_calling` (how many rooms were asking for
+heat when it started), `samples`, `rate`, `end` (`reached`, `changed` or
+`timeout`), `lag_min`, `reach_min`, `k` and `usable`. Each closed episode is
+also logged at info level, `Learning: ...`.
+
 ## Config document
 
 One JSON document, stored by the integration. An example with an invented
@@ -274,7 +348,8 @@ household:
       "control": false }
   ],
   "exceptions": [ { "person": "pip", "night": "2026-01-08", "here": true } ],
-  "holidays": [ { "start": "2026-02-13", "end": "2026-02-20", "preheat_hours": 6 } ]
+  "holidays": [ { "start": "2026-02-13", "end": "2026-02-20", "preheat_hours": 6 } ],
+  "outside_sensor": "sensor.outdoor"
 }
 ```
 
@@ -287,6 +362,13 @@ household:
   on quarter hours. `24:00` is allowed as an end.
 - `watch` lists other climate entities in the same room that are watched for
   manual changes but never written to.
+- `temp_sensor` (optional, per room) is a sensor with the room's air
+  temperature. When set, the room's `current_temperature` comes from it, and the
+  learning record measures the room from it as well as from the climate
+  entity. Nothing else reads it.
+- `outside_sensor` (optional) is a numeric `sensor` with the outside
+  temperature, or a `weather` entity whose `temperature` attribute is read.
+  Only the learning record uses it.
 - `rev` increments on every accepted write; a write must quote the `rev` it
   started from.
 

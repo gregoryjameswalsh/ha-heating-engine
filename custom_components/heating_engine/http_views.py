@@ -9,6 +9,7 @@ write; the household decides who gets a token.
   POST /api/heating_engine/config           {config, base_rev, source?} -> {rev}; 409 rev_conflict, 400 invalid_config
   GET  /api/heating_engine/plan?start=&end= {segments}
   GET  /api/heating_engine/log              would-writes, writes, unexpected changes, requests
+  GET  /api/heating_engine/learning         the learning record: per room, summary and kept episodes
   POST /api/heating_engine/hold             {room, kind, temp?, until?, source?} -> {room: <room state>, hold}
   POST /api/heating_engine/cancel-hold      {room, source?} -> {room: <room state>, hold: null}
 
@@ -93,6 +94,7 @@ def room_entry(engine: HeatingEngine, room: Room) -> dict[str, Any]:
     d["temps"] = room.temps.to_dict()
     d["occupants"] = list(room.occupants)
     d["control"] = room.control
+    d["learning"] = engine.learning_summary(room)
     return d
 
 
@@ -281,10 +283,21 @@ class LogView(_View):
         return self.json(engine.recent_log())
 
 
+class LearningView(_View):
+    url = "/api/heating_engine/learning"
+    name = "api:heating_engine:learning"
+
+    async def get(self, request: web.Request) -> web.Response:
+        engine = self._engine_or_error(request)
+        if isinstance(engine, web.Response):
+            return engine
+        return self.json(engine.learning_record())
+
+
 def async_register_views(hass: HomeAssistant) -> None:
     data = hass.data.setdefault(DOMAIN, {})
     if data.get("http_registered"):
         return
-    for view in (StateView(), ConfigView(), PlanView(), LogView(), HoldView(), CancelHoldView()):
+    for view in (StateView(), ConfigView(), PlanView(), LogView(), LearningView(), HoldView(), CancelHoldView()):
         hass.http.register_view(view)
     data["http_registered"] = True

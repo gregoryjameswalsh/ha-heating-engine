@@ -51,12 +51,16 @@ from .const import (
 from .heating_core import (
     CONFIG_DETAIL,
     HOLD_KINDS,
+    SOURCE_DEVICE,
+    SOURCE_SENSOR,
     Boost,
     CalendarEvent,
     Config,
     EngineState,
+    Episode,
     ExceptionNight,
     Hold,
+    Learning,
     ManualOverride,
     Request,
     RequestLog,
@@ -75,6 +79,7 @@ from .heating_core import (
     resolve_plan,
     write_cause,
 )
+from .heating_core.learning import Sample
 from .calendar_read import read_calendar
 from .heating_core.activity import (
     ACTION_BOOST,
@@ -211,6 +216,9 @@ class HeatingEngine:
         self.would_write_log: list[dict[str, Any]] = []
         self.write_log: list[dict[str, Any]] = []
         self.requests = RequestLog(limit=LOG_LIMIT)  # every accepted request, with who asked
+        # warm-ups and cool-downs per room, measured from the readings; acts on nothing
+        self.learning = Learning()
+        self._learning_failed = False  # warned about once, until it works again
         self._last_would: dict[str, tuple[float, str | None]] = {}
         # room id -> (setpoint to put back once a boost or hold on an observing room
         # has ended, the source of that boost or hold)
@@ -233,6 +241,7 @@ class HeatingEngine:
         self.would_write_log = stored.would_write
         self.write_log = stored.writes
         self.requests = stored.requests
+        self.learning = stored.learning
         if self.calendar_events:
             self.calendar_ok = None  # last known, not yet confirmed this run
             _LOGGER.info("Using the last known calendar events (%s) until the first read succeeds", ", ".join(self.calendar_events))
@@ -267,6 +276,7 @@ class HeatingEngine:
                 would_write=self.would_write_log,
                 writes=self.write_log,
                 requests=self.requests,
+                learning=self.learning,
             )
         )
 
@@ -327,6 +337,8 @@ class HeatingEngine:
         for rid in old_rooms - {r.id for r in cfg.rooms}:
             self.rooms.pop(rid, None)
             self._last_would.pop(rid, None)
+        if self.learning.prune({r.id for r in cfg.rooms}):
+            self._state_dirty = True
         self._subscribe_states()
         _LOGGER.info("Config accepted: rev %s, %d rooms (%d in control), %d people", cfg.rev, len(cfg.rooms), sum(1 for r in cfg.rooms if r.control), len(cfg.people))
         async_dispatcher_send(self.hass, SIGNAL_CONFIG_CHANGED)
@@ -549,6 +561,7 @@ class HeatingEngine:
             problems.append(Problem(PROBLEM_CALENDAR, None, f"Can't check the calendar ({known}): {self.calendar_error}"))
 
         self._expire_runtime(now)
+        self._learn(now)
 
         current = resolve_now(self.config, now_local, self.calendar_events, self.state)
 
@@ -666,6 +679,87 @@ class HeatingEngine:
         if climate_state is not None:
             return _float_or_none(climate_state.attributes.get("current_temperature"))
         return None
+
+    # ------------------------------------------------------------------ learning
+
+    def _learn(self, now: datetime) -> None:
+        """Feed the learning record one sample per room and reading source.
+
+        The record acts on nothing, so a failure here is logged once and never
+        stops the evaluation that decides and writes temperatures."""
+        try:
+            outside = self._outside_temperature()
+            readings: dict[str, tuple[float | None, float | None, str | None]] = {}
+            calling = 0
+            for room in self.config.rooms:
+                state = self.hass.states.get(room.climate)
+                available, setpoint, mode = _setpoint_and_mode(state)
+                device = _float_or_none(state.attributes.get("current_temperature")) if available and state is not None else None
+                readings[room.id] = (device, setpoint, mode)
+                if mode == HEAT and setpoint is not None and device is not None and setpoint > device:
+                    calling += 1
+            for room in self.config.rooms:
+                device, setpoint, mode = readings[room.id]
+                sources: dict[str, tuple[str, float | None]] = {SOURCE_DEVICE: (room.climate, device)}
+                if room.temp_sensor:
+                    sources[SOURCE_SENSOR] = (room.temp_sensor, self._numeric_state(room.temp_sensor))
+                else:
+                    self.learning.forget_source(room.id, SOURCE_SENSOR)
+                for source, (entity, reading) in sources.items():
+                    episode = self.learning.feed(room.id, source, entity, Sample(now, reading, setpoint, mode, outside, calling))
+                    if episode is not None:
+                        self._state_dirty = True  # the record survives a restart
+                        _LOGGER.info("Learning: %s", _episode_words(room.name, source, episode))
+        except Exception:  # noqa: BLE001 - the record must never stop the heating
+            if not self._learning_failed:
+                _LOGGER.exception("The learning record failed; the heating carries on without it")
+            self._learning_failed = True
+        else:
+            if self._learning_failed:
+                _LOGGER.info("The learning record is working again")
+            self._learning_failed = False
+
+    def _numeric_state(self, entity_id: str) -> float | None:
+        st = self.hass.states.get(entity_id)
+        if st is None or st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        return _float_or_none(st.state)
+
+    def _outside_temperature(self) -> float | None:
+        """From `outside_sensor`: a numeric sensor's state, or a weather entity's
+        `temperature` attribute. None when unset or not readable."""
+        entity_id = self.config.outside_sensor
+        if not entity_id:
+            return None
+        if entity_id.startswith("weather."):
+            st = self.hass.states.get(entity_id)
+            if st is None or st.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                return None
+            return _float_or_none(st.attributes.get("temperature"))
+        return self._numeric_state(entity_id)
+
+    def learning_entities(self, room: Any) -> dict[str, str]:
+        """The reading sources a room has now, by source name."""
+        entities = {SOURCE_DEVICE: room.climate}
+        if room.temp_sensor:
+            entities[SOURCE_SENSOR] = room.temp_sensor
+        return entities
+
+    def learning_summary(self, room: Any) -> dict[str, Any]:
+        """The `learning` block of a room in GET state."""
+        return self.learning.room_summary(room.id, self.learning_entities(room), self._tz)
+
+    def learning_record(self) -> dict[str, Any]:
+        """Everything the record holds, for GET learning: per room, the summary
+        and every kept episode, oldest first."""
+        rooms: dict[str, Any] = {}
+        for room in self.config.rooms:
+            rooms[room.id] = {
+                "name": room.name,
+                "summary": self.learning_summary(room),
+                "episodes": {source: [e.to_dict() for e in eps] for source, eps in self.learning.episodes.get(room.id, {}).items()},
+            }
+        return {"outside_sensor": self.config.outside_sensor, "outside": self._outside_temperature(), "rooms": rooms}
 
     def _expire_runtime(self, now: datetime) -> None:
         for rid, b in list(self.state.boosts.items()):
@@ -909,3 +1003,14 @@ class HeatingEngine:
             "unexpected_changes": self.changes.to_list(),
             "requests": self.requests.to_list(),
         }
+
+
+def _episode_words(room_name: str, source: str, ep: Episode) -> str:
+    """One log line for a closed episode."""
+    minutes = int((ep.ended - ep.started).total_seconds() // 60)
+    if ep.kind == "heat":
+        reach = f"reached in {ep.reach_min:g} min" if ep.reach_min is not None else f"ended ({ep.end}) after {minutes} min"
+        return f"{room_name} ({source}) warm-up from {ep.from_temp:g} towards {ep.target:g}: {ep.rate:+.2f} C/h after a {ep.lag_min:g} min lag, {reach}"
+    floor = f"towards {ep.target:g}" if ep.target is not None else "with the heating off"
+    k = f", k {ep.k:g}" if ep.k is not None else ""
+    return f"{room_name} ({source}) cool-down from {ep.from_temp:g} {floor}: {ep.rate:+.2f} C/h{k}, ended ({ep.end}) after {minutes} min"

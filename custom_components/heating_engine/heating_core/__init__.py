@@ -36,6 +36,7 @@ from .model import (
     Segment,
     Temps,
 )
+from .learning import SOURCE_DEVICE, SOURCE_SENSOR, Episode, Learning, Sample
 from .occupancy import person_here_tonight
 from .persist import logs_from_dict, logs_to_dict, state_from_dict, state_to_dict
 from .resolve import PLAN_GRACE, matches_plan, next_schedule_change, override_end, resolve_now, resolve_plan
@@ -46,10 +47,16 @@ API_VERSION = 1
 # must work against older engines too. All additive; api_version stays 1.
 #   holds     the hold / cancel_hold services and views, `hold` in room state
 #   activity  `source` on requests, `requests` in the log, `cause` on writes
-FEATURES = ("holds", "activity")
+#   learning  `learning` in room state, GET learning, `outside_sensor` in the config
+FEATURES = ("holds", "activity", "learning")
 
 __all__ = [
     "API_VERSION",
+    "SOURCE_DEVICE",
+    "SOURCE_SENSOR",
+    "Episode",
+    "Learning",
+    "Sample",
     "CONFIG_DETAIL",
     "FEATURES",
     "REQUEST_ACTIONS",
