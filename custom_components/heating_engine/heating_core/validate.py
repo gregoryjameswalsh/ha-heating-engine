@@ -58,6 +58,8 @@ def validate_config(config: Config) -> list[str]:
         errors.append("rev must be zero or more")
     if config.rota_anchor.weekday() != 0:
         errors.append(f"The rota anchor {config.rota_anchor.isoformat()} is not a Monday")
+    if config.outside_sensor is not None and not _is_entity_id(config.outside_sensor, ("sensor", "weather")):
+        errors.append(f"The outside sensor {config.outside_sensor!r} is not a sensor or weather entity id")
 
     # ---- people ----
     seen_people: set[str] = set()
@@ -163,6 +165,14 @@ def validate_config(config: Config) -> list[str]:
             errors.append(f"Holiday from {h.start.isoformat()}: pre-heat hours cannot be negative")
 
     return errors
+
+
+def _is_entity_id(value: str, domains: tuple[str, ...]) -> bool:
+    """`domain.object_id` with a domain from `domains` and a lower-case object id."""
+    domain, dot, object_id = value.partition(".")
+    if not dot or domain not in domains or not object_id:
+        return False
+    return all(c.islower() or c.isdigit() or c == "_" for c in object_id)
 
 
 def _safe_minutes(value: str) -> int:

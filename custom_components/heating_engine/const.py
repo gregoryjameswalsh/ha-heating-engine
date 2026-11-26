@@ -31,6 +31,7 @@ WS_GET_CONFIG = f"{DOMAIN}/get_config"
 WS_SET_CONFIG = f"{DOMAIN}/set_config"
 WS_PLAN = f"{DOMAIN}/plan"
 WS_LOG = f"{DOMAIN}/log"
+WS_LEARNING = f"{DOMAIN}/learning"
 
 MODE_OBSERVE = "observe"
 MODE_CONTROL = "control"
